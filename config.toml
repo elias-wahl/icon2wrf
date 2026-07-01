@@ -1,5 +1,0 @@
-[paths]
-input_dir = "input"
-output_dir = "output"
-source_grid = "grid_config/source_grid.txt"
-target_grid = "grid_config/target_grid.txt"

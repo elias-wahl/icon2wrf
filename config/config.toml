@@ -1,0 +1,5 @@
+[paths]
+input_dir = "input"
+output_dir = "output"
+source_grid = "config/source_grid.txt"
+target_grid = "config/target_grid.txt"

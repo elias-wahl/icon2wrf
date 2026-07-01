@@ -17,12 +17,12 @@ except ImportError:
         print("[ERROR] Please install tomli for Python < 3.11: pip install tomli")
         sys.exit(1)
 
-CREDENTIALS_FILE = "credentials.toml"
+CREDENTIALS_FILE = "config/credentials.toml"
 
 def load_credentials():
     creds = {}
-    if os.path.exists("config.toml"):
-        with open("config.toml", "rb") as f:
+    if os.path.exists("config/config.toml"):
+        with open("config/config.toml", "rb") as f:
             creds.update(tomllib.load(f).get("ftp", {}))
             
     if os.path.exists(CREDENTIALS_FILE):
@@ -82,10 +82,17 @@ def save_credentials(url, username):
 
 def extract_gz(gz_path, out_path):
     print(f"  Unzipping to {out_path}...")
-    with gzip.open(gz_path, 'rb') as f_in:
-        with open(out_path, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    os.remove(gz_path)
+    tmp_out_path = Path(str(out_path) + ".tmp")
+    try:
+        with gzip.open(gz_path, 'rb') as f_in:
+            with open(tmp_out_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        tmp_out_path.rename(out_path)
+    finally:
+        if tmp_out_path.exists():
+            tmp_out_path.unlink()
+        if Path(gz_path).exists():
+            Path(gz_path).unlink()
 
 def get_filename_for_offset(offset_hours):
     days = offset_hours // 24
@@ -236,14 +243,20 @@ def main():
                 continue
                 
             print(f"Downloading {gz_file} for {target_str}...")
+            tmp_gz_path = local_gz_path.with_suffix(".gz.tmp")
             try:
-                with open(local_gz_path, 'wb') as f:
+                with open(tmp_gz_path, 'wb') as f:
                     ftp.retrbinary(f"RETR {gz_file}", f.write)
+                tmp_gz_path.rename(local_gz_path)
                 extract_gz(local_gz_path, local_nc_path)
             except Exception as e:
                 print(f"[ERROR] Failed downloading {gz_file}: {e}")
+                if tmp_gz_path.exists():
+                    tmp_gz_path.unlink()
                 if local_gz_path.exists():
                     local_gz_path.unlink()
+                if local_nc_path.exists():
+                    local_nc_path.unlink()
         
         ftp.cwd("/")
         

@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--skip-file", help="Filename to skip (e.g. the domain file)")
     args = parser.parse_args()
 
-    config_path = "config.toml"
+    config_path = "config/config.toml"
     if not os.path.exists(config_path):
         print(f"[ERROR] Configuration file {config_path} not found.")
         sys.exit(1)
