@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icon_wrf_regrid"
+version = "0.1.0"
+description = "Batch processing package for regridding TEAMx ICON 500m runs to WRF format"
+requires-python = ">=3.9"
+dependencies = [
+    "xarray",
+    "cfgrib",
+    "netCDF4",
+    "scipy",
+    "tomli; python_version < '3.11'"
+]

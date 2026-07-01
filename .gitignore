@@ -1,0 +1,26 @@
+# Python caches
+__pycache__/
+*.pyc
+
+# Data directories
+input/
+output/
+
+# Large files
+*.nc
+*.grib2
+*.grb2
+*.grb
+ilf*
+igf*
+isf*
+*.idx
+
+# Log files
+*.log
+
+# Secrets/Credentials
+credentials.toml
+
+# Archive
+archive/
