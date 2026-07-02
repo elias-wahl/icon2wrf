@@ -11,6 +11,33 @@ This package was originally tailored specifically to regrid the special high-res
 - **WRF Diagnostics**: Verifies vertical levels and expected standard meteorological variables, making safe adjustments like `invertlev` for WRF compatibility.
 - **Vtable Recommendations**: Analyzes the structure of your data and informs you whether to use `Vtable.ICONp` or `Vtable.ICONm`.
 
+## Installation
+
+This package requires Python 3.9+ and the **Climate Data Operators (CDO)** system binary. CDO must be installed separately as it is a system-level dependency and cannot be installed via `pip` in `pyproject.toml`.
+
+### 1. Install CDO
+
+**Using Conda (Recommended):**
+```bash
+conda install -c conda-forge cdo
+```
+
+**Using Ubuntu/Debian:**
+```bash
+sudo apt-get install cdo
+```
+
+**Using macOS (Homebrew):**
+```bash
+brew install cdo
+```
+
+### 2. Install Python Package
+Once CDO is installed on your system, you can install this package and its Python dependencies:
+```bash
+pip install -e .
+```
+
 ## Usage
 1. (Optional) Run the automated FTP downloader to fetch your data:
 ```bash
