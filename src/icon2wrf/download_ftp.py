@@ -128,7 +128,7 @@ def main():
     print("\nThe FTP server runs simulations every 12h, and each covers 48h.")
     print("How would you like to build your time span?")
     print("  1) Freshest Run: Always use the run that started closest to the target time step (stitches multiple runs, changes every 12h).")
-    print("  2) Longest Run: Use the earliest run that covers the time step, and stick with it for up to 48h before switching.")
+    print("  2) Longest Run: Use the most recent run that covers the time step, and stick with it for up to 48h before switching.")
     strategy = input("Select strategy (1 or 2): ").strip()
     if strategy not in ["1", "2"]:
         print("[ERROR] Invalid strategy.")
@@ -198,12 +198,12 @@ def main():
             # Freshest: latest valid run
             chosen_run_dt, dir_name = valid_runs[-1]
         else:
-            # Longest: if current_longest_run is valid, use it. Else pick the earliest valid run.
+            # Longest: if current_longest_run is valid, use it. Else pick the most recent valid run.
             if current_longest_run and current_longest_run in valid_runs:
                 chosen_run_dt, dir_name = current_longest_run
             else:
-                chosen_run_dt, dir_name = valid_runs[0]
-                current_longest_run = valid_runs[0]
+                chosen_run_dt, dir_name = valid_runs[-1]
+                current_longest_run = valid_runs[-1]
                 
         offset_hours = int((target - chosen_run_dt).total_seconds() // 3600)
         gz_file = get_filename_for_offset(offset_hours)
