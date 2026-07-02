@@ -34,7 +34,7 @@ def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=Fa
         return False
         
     # Filter harmless warnings for cleaner output
-    harmless = ["ECCODES ERROR", "grib_set_string", "gribapiDefParam", "cdfInqContents", "Parameter Database", "Changed zaxis type"]
+    harmless = ["ECCODES ERROR", "grib_set_string", "gribapiDefParam", "cdfInqContents", "Parameter Database", "Changed zaxis type", "set_coordinates_varids"]
     filtered_err = [line for line in stderr.splitlines() if not any(h in line for h in harmless)]
     
     for line in filtered_err:
