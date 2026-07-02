@@ -19,7 +19,7 @@ from .diagnostics import check_wrf_ready
 
 def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=False):
     """Runs CDO to regrid NetCDF to GRIB2, suppressing harmless ECCODES warnings."""
-    cmd = ["cdo", "-f", "grb2", f"remapdis,{target_grid}"]
+    cmd = ["cdo", "-f", "grb2", "-settunits,hours", f"remapdis,{target_grid}"]
     if invertlev:
         cmd.append("-invertlev")
     cmd.extend([f"-setgrid,{source_grid}", str(input_nc), str(output_grib)])
