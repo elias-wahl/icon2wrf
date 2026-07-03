@@ -59,6 +59,8 @@ pip install -e .
 
 6. Link the generated `.grib2` files in your `output/` folder to your WPS working directory using `link_grib.csh` and run `ungrib.exe`.
 
+> **IMPORTANT - WPS Namelist**: Since ICON provides its own pressure fields natively, you do not need to generate `PRES` files (e.g. via `calc_ecmwf_p.exe`). Make sure that your `namelist.wps` does **NOT** include `'PRES'` in the `fg_name` parameter of the `&metgrid` section (e.g., use `fg_name = 'FILE'` or `fg_name = 'FILE', 'SFC'`, but not `'PRES'`). Otherwise, `metgrid.exe` will crash complaining about missing `PRES` files.
+
 > **Note on WRF Vtables**: If you are using an older version of WRF/WPS that does not natively include the Vtables for ICON, we have included `Vtable.ICONp` and `Vtable.ICONm` in the `vtables/` directory of this repository! You can simply copy or symlink them to your WPS folder.
 
 ## Under the Hood (Technical Details)

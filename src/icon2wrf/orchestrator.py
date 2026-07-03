@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import subprocess
+import shutil
 from pathlib import Path
 
 # Fallback for Python < 3.11
@@ -19,7 +20,7 @@ from .diagnostics import check_wrf_ready
 
 def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=False):
     """Runs CDO to regrid NetCDF to GRIB2, suppressing harmless ECCODES warnings."""
-    cmd = ["cdo", "-f", "grb2", "-settunits,hours", f"remapdis,{target_grid}"]
+    cmd = ["cdo", "-f", "grb2", "-b", "16", "-settunits,hours", f"remapdis,{target_grid}"]
     if invertlev:
         cmd.append("-invertlev")
     cmd.extend([f"-setgrid,{source_grid}", str(input_nc), str(output_grib)])
@@ -42,6 +43,48 @@ def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=Fa
             print(line)
             
     return True
+
+def fix_time_metadata(grib_file, datestr):
+    """Fixes the time metadata in GRIB2 files that CDO corrupts by resetting it using wgrib2 or eccodes."""
+    # Extract date from first 10 chars (e.g. 2019100100)
+    if len(datestr) < 10 or not datestr[:10].isdigit():
+        print(f"[WARNING] Could not parse valid date from filename: {datestr}. Skipping time metadata fix.")
+        return False
+
+    yyyy = datestr[:4]
+    mm = datestr[4:6]
+    dd = datestr[6:8]
+    hh = datestr[8:10]
+    
+    temp_file = grib_file.with_name(f"temp_fix_{grib_file.name}")
+    
+    if shutil.which("wgrib2"):
+        cmd = ["wgrib2", str(grib_file), "-set_date", f"{yyyy}{mm}{dd}{hh}", "-set_ftime", "0 hours", "-grib", str(temp_file)]
+        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _, stderr = process.communicate()
+        if process.returncode == 0:
+            temp_file.replace(grib_file)
+            return True
+        else:
+            print(f"[ERROR] wgrib2 failed to fix time on {grib_file.name}: {stderr}")
+            if temp_file.exists(): temp_file.unlink()
+            return False
+            
+    elif shutil.which("grib_set"):
+        cmd = ["grib_set", "-s", f"indicatorOfUnitOfTimeRange=1,forecastTime=0,dataDate={yyyy}{mm}{dd},dataTime={hh}00", str(grib_file), str(temp_file)]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, stderr = process.communicate()
+        if process.returncode == 0:
+            temp_file.replace(grib_file)
+            return True
+        else:
+            print(f"[ERROR] grib_set failed to fix time on {grib_file.name}: {stderr}")
+            if temp_file.exists(): temp_file.unlink()
+            return False
+            
+    else:
+        print("[ERROR] Neither wgrib2 nor grib_set (eccodes) found. Cannot fix corrupted time units from CDO.")
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description="ICON to WRF Batch Regridder")
@@ -150,12 +193,14 @@ def main():
         if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True):
             results[basename] = "ERROR: 3D Regridding failed"
             continue
+        fix_time_metadata(out_3d, basename)
             
         # 4. Regrid Surface fields
         print("\nRegridding Surface fields...")
         if not run_cdo_regrid(temp_sfc, out_sfc, source_grid, target_grid, invertlev=False):
             results[basename] = "ERROR: Surface Regridding failed"
             continue
+        fix_time_metadata(out_sfc, basename)
             
         # 5. Regrid Soil fields if present
         if has_soil_moist:
@@ -163,11 +208,13 @@ def main():
             if not run_cdo_regrid(temp_soil_moist, out_soil_moist, source_grid, target_grid, invertlev=False):
                 results[basename] = "ERROR: Soil Moisture Regridding failed"
                 continue
+            fix_time_metadata(out_soil_moist, basename)
         if has_soil_temp:
             print("\nRegridding Soil Temperature fields...")
             if not run_cdo_regrid(temp_soil_temp, out_soil_temp, source_grid, target_grid, invertlev=False):
                 results[basename] = "ERROR: Soil Temperature Regridding failed"
                 continue
+            fix_time_metadata(out_soil_temp, basename)
             
         # Cleanup
         if temp_3d.exists(): temp_3d.unlink()
