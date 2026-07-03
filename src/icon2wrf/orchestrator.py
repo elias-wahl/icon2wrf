@@ -164,8 +164,12 @@ def main():
         out_3d = output_dir / f"{basename}_3d.grib2"
         out_sfc = output_dir / f"{basename}_sfc.grib2"
         
-        if out_3d.exists() and out_sfc.exists():
-            print(f"[{basename}] Skipping: Processed files already exist in output directory.")
+        out_soil_moist = output_dir / f"{basename}_soil_moist.grib2"
+        out_soil_temp = output_dir / f"{basename}_soil_temp.grib2"
+        
+        # Determine what's already processed to avoid skipping if only some files were deleted
+        if out_3d.exists() and out_sfc.exists() and out_soil_moist.exists() and out_soil_temp.exists():
+            print(f"[{basename}] Skipping: All processed files already exist in output directory.")
             results[basename] = "SKIPPED: already in output"
             continue
             
@@ -176,8 +180,7 @@ def main():
         temp_soil_moist = Path("temp_soil_moist_processing.nc")
         temp_soil_temp = Path("temp_soil_temp_processing.nc")
         
-        out_soil_moist = output_dir / f"{basename}_soil_moist.grib2"
-        out_soil_temp = output_dir / f"{basename}_soil_temp.grib2"
+        # These are now defined above, so just keep the temp files here
         
         # 1. Extract NetCDFs using Python (Bypasses AEC compression errors)
         if not extract_3d(str(input_file), str(temp_3d)):

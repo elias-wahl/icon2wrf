@@ -54,6 +54,12 @@ def extract_soil_moist(input_grib: str, output_nc: str) -> bool:
         if len(ds_soil.data_vars) == 0:
             print(f"  -> No Soil Moisture variables found in {input_grib}")
             return False
+            
+        # CDO reads the 'param' attribute to determine the GRIB2 parameter (num.cat.dis)
+        for var in ds_soil.data_vars:
+            ds_soil[var].attrs['param'] = '20.3.2'
+            ds_soil[var].attrs.pop('GRIB_paramId', None)
+            
         ds_soil.to_netcdf(output_nc)
         print(f"Successfully saved Soil Moisture fields to {output_nc}")
         return True
@@ -72,6 +78,12 @@ def extract_soil_temp(input_grib: str, output_nc: str) -> bool:
         if len(ds_soil.data_vars) == 0:
             print(f"  -> No Soil Temperature variables found in {input_grib}")
             return False
+            
+        # CDO reads the 'param' attribute to determine the GRIB2 parameter (num.cat.dis)
+        for var in ds_soil.data_vars:
+            ds_soil[var].attrs['param'] = '18.3.2'
+            ds_soil[var].attrs.pop('GRIB_paramId', None)
+            
         ds_soil.to_netcdf(output_nc)
         print(f"Successfully saved Soil Temperature fields to {output_nc}")
         return True
