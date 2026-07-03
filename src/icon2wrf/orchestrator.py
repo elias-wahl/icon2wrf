@@ -83,8 +83,29 @@ def fix_time_metadata(grib_file, datestr):
             return False
             
     else:
-        print("[ERROR] Neither wgrib2 nor grib_set (eccodes) found. Cannot fix corrupted time units from CDO.")
-        return False
+        try:
+            import eccodes
+            try:
+                with open(grib_file, 'rb') as fin, open(temp_file, 'wb') as fout:
+                    while True:
+                        gid = eccodes.codes_grib_new_from_file(fin)
+                        if gid is None:
+                            break
+                        eccodes.codes_set(gid, 'indicatorOfUnitOfTimeRange', 1)
+                        eccodes.codes_set(gid, 'forecastTime', 0)
+                        eccodes.codes_set(gid, 'dataDate', int(f"{yyyy}{mm}{dd}"))
+                        eccodes.codes_set(gid, 'dataTime', int(f"{hh}00"))
+                        eccodes.codes_write(gid, fout)
+                        eccodes.codes_release(gid)
+                temp_file.replace(grib_file)
+                return True
+            except Exception as e:
+                print(f"[ERROR] Python eccodes failed to fix time on {grib_file.name}: {e}")
+                if temp_file.exists(): temp_file.unlink()
+                return False
+        except ImportError:
+            print("[ERROR] Neither wgrib2, grib_set, nor Python eccodes module found. Cannot fix corrupted time units from CDO.")
+            return False
 
 def main():
     parser = argparse.ArgumentParser(description="ICON to WRF Batch Regridder")
