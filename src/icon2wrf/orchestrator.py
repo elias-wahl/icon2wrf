@@ -16,11 +16,14 @@ except ImportError:
         sys.exit(1)
 
 from .surface_extractor import extract_surface, extract_3d, extract_soil_moist, extract_soil_temp
-from .diagnostics import check_wrf_ready
+from .diagnostics import check_wrf_ready, check_final_gribs
 
-def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=False):
+def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=False, extra_args=None):
     """Runs CDO to regrid NetCDF to GRIB2, suppressing harmless ECCODES warnings."""
-    cmd = ["cdo", "-f", "grb2", "-b", "16", "-settunits,hours", "-setmisstonn", f"-remapdis,{target_grid}"]
+    cmd = ["cdo", "-f", "grb2", "-b", "16", "-settunits,hours", "-setmisstonn"]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(f"-remapdis,{target_grid}")
     if invertlev:
         cmd.append("-invertlev")
     cmd.extend([f"-setgrid,{source_grid}", str(input_nc), str(output_grib)])
@@ -107,6 +110,82 @@ def fix_time_metadata(grib_file, datestr):
             print("[ERROR] Neither wgrib2, grib_set, nor Python eccodes module found. Cannot fix corrupted time units from CDO.")
             return False
 
+def fix_soil_levels(grib_file, is_temp=True):
+    """Forces the Level Type to 106 and injects exact physical depths in meters."""
+    temp_file = grib_file.with_name(f"temp_soil_fix_{grib_file.name}")
+    depths_temp = [0.005, 0.02, 0.06, 0.18, 0.54, 1.62, 4.86, 14.58]
+    depths_moist_top = [0.0, 0.01, 0.03, 0.09, 0.27, 0.81, 2.43, 7.29]
+    depths_moist_bot = [0.01, 0.03, 0.09, 0.27, 0.81, 2.43, 7.29, 21.87]
+    
+    try:
+        import eccodes
+        with open(grib_file, 'rb') as fin, open(temp_file, 'wb') as fout:
+            idx = 0
+            while True:
+                gid = eccodes.codes_grib_new_from_file(fin)
+                if gid is None:
+                    break
+                    
+                # Force the surface type to 106 (Depth Below Land)
+                # Setting both the string and the integer ensures eccodes doesn't revert it
+                try:
+                    eccodes.codes_set(gid, 'typeOfLevel', 'depthBelowLand')
+                except Exception:
+                    pass
+                eccodes.codes_set(gid, 'typeOfFirstFixedSurface', 106)
+                
+                if is_temp:
+                    if idx < len(depths_temp):
+                        eccodes.codes_set_double(gid, 'level', depths_temp[idx])
+                else:
+                    if idx < len(depths_moist_top):
+                        # For moisture, Vtable expects two levels (Layer)
+                        eccodes.codes_set(gid, 'typeOfSecondFixedSurface', 106)
+                        
+                        # In ICON moisture depths, the values in Vtable are in CM (0-1, 1-3, etc)
+                        # We set the top and bottom of the layer in meters.
+                        if idx == 0:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.0)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 0.01)
+                        elif idx == 1:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.01)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 0.03)
+                        elif idx == 2:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.03)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 0.09)
+                        elif idx == 3:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.09)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 0.27)
+                        elif idx == 4:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.27)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 0.81)
+                        elif idx == 5:
+                            eccodes.codes_set_double(gid, 'topLevel', 0.81)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 2.43)
+                        elif idx == 6:
+                            eccodes.codes_set_double(gid, 'topLevel', 2.43)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 7.29)
+                        elif idx == 7:
+                            eccodes.codes_set_double(gid, 'topLevel', 7.29)
+                            eccodes.codes_set_double(gid, 'bottomLevel', 21.87)
+                        else:
+                            eccodes.codes_set_double(gid, 'level', depths_moist_top[idx])
+                        try:
+                            eccodes.codes_set(gid, 'typeOfSecondFixedSurface', 106)
+                        except:
+                            pass
+                            
+                eccodes.codes_write(gid, fout)
+                eccodes.codes_release(gid)
+                idx += 1
+                
+        temp_file.replace(grib_file)
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to fix soil levels on {grib_file.name}: {e}")
+        if temp_file.exists(): temp_file.unlink()
+        return False
+
 def main():
     parser = argparse.ArgumentParser(description="ICON to WRF Batch Regridder")
     parser.add_argument("--source-grid", help="Path to custom source grid file")
@@ -136,25 +215,20 @@ def main():
     if not os.path.exists(source_grid) or not os.path.exists(target_grid):
         print(f"[ERROR] Grid definitions not found: {source_grid} or {target_grid}")
         sys.exit(1)
-        
-    input_files = [
-        f for f in input_dir.iterdir() 
-        if f.is_file() 
-        and not f.name.startswith('.') 
-        and not f.name.endswith('.idx') 
-        and not f.name.endswith('.nc')
-        and not f.name.endswith('.gz')
-    ]
-    
-    if args.skip_file:
-        skip_path = Path(args.skip_file).resolve()
-        input_files = [f for f in input_files if f.resolve() != skip_path]
-    
-    if not input_files:
-        print(f"No files found in {input_dir}. Please place your raw GRIB files there.")
-        return
-        
-    print(f"Found {len(input_files)} file(s) in {input_dir}")
+     # Gather all unique timestamps/basenames
+    input_files = []
+    for f in input_dir.iterdir():
+        if f.is_file() and not f.name.endswith(".idx"):
+            # The base name is everything before '_3d', '_sfc', etc.
+            # If it's a raw file, it won't have those suffixes.
+            base = f.name.split('_3d')[0].split('_sfc')[0].split('_soil')[0]
+            if base not in [x.name for x in input_files]:
+                # We append a Path object that represents the base prefix
+                input_files.append(input_dir / base)
+                
+    input_files.sort()
+                
+    print(f"\nFound {len(input_files)} file(s) in {input_dir.name}")
     
     results = {}
     vtables_found = set()
@@ -183,13 +257,12 @@ def main():
         # These are now defined above, so just keep the temp files here
         
         # 1. Extract NetCDFs using Python (Bypasses AEC compression errors)
-        if not extract_3d(str(input_file), str(temp_3d)):
+        has_3d = extract_3d(str(input_file), str(temp_3d))
+        if not has_3d:
             if basename.endswith("00000000"):
-                print(f"[INFO] Skipping {basename}: It is an initialization file (+00h) and lacks 3D fields. Please use the previous run instead.")
-                results[basename] = "SKIPPED: +00h Initialization file (use previous run)"
+                print(f"[INFO] Initial file {basename} lacks 3D fields. Proceeding with surface data only.")
             else:
-                results[basename] = "ERROR: 3D Extraction failed"
-            continue
+                print(f"[WARNING] 3D Extraction failed for {basename}. Proceeding with surface data only if available.")
         if not extract_surface(str(input_file), str(temp_sfc)):
             results[basename] = "ERROR: Surface Extraction failed"
             continue
@@ -204,20 +277,31 @@ def main():
             
         # 2. Run Diagnostics
         print("\nRunning Diagnostics...")
-        diag_ok, vtable_sugg = check_wrf_ready(str(temp_3d), str(temp_sfc), soil_files=soil_files_for_diag)
-        if not diag_ok:
-            print("[ERROR] Diagnostics failed.")
-            results[basename] = "ERROR: Diagnostics failed"
-            continue
-        if vtable_sugg:
-            vtables_found.add(vtable_sugg)
+        if has_3d:
+            diag_ok, vtable_sugg = check_wrf_ready(str(temp_3d), str(temp_sfc), soil_files=soil_files_for_diag)
+            if not diag_ok:
+                print("[ERROR] Diagnostics failed.")
+                results[basename] = "ERROR: Diagnostics failed"
+                continue
+            if vtable_sugg:
+                vtables_found.add(vtable_sugg)
+        else:
+            print("[INFO] Skipping 3D diagnostics because no 3D fields are present.")
+            
+        # Track files for final validation
+        final_3d = None
+        final_sfc = None
+        final_sm = None
+        final_st = None
             
         # 3. Regrid 3D fields
-        print("\nRegridding 3D fields...")
-        if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True):
-            results[basename] = "ERROR: 3D Regridding failed"
-            continue
-        fix_time_metadata(out_3d, basename)
+        if has_3d:
+            print("\nRegridding 3D fields...")
+            if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True):
+                results[basename] = "ERROR: 3D Regridding failed"
+                continue
+            fix_time_metadata(out_3d, basename)
+            final_3d = str(out_3d)
             
         # 4. Regrid Surface fields
         print("\nRegridding Surface fields...")
@@ -225,6 +309,7 @@ def main():
             results[basename] = "ERROR: Surface Regridding failed"
             continue
         fix_time_metadata(out_sfc, basename)
+        final_sfc = str(out_sfc)
             
         # 5. Regrid Soil fields if present
         if has_soil_moist:
@@ -233,15 +318,28 @@ def main():
                 results[basename] = "ERROR: Soil Moisture Regridding failed"
                 continue
             fix_time_metadata(out_soil_moist, basename)
+            fix_soil_levels(out_soil_moist, is_temp=False)
+            final_sm = str(out_soil_moist)
         if has_soil_temp:
             print("\nRegridding Soil Temperature fields...")
             if not run_cdo_regrid(temp_soil_temp, out_soil_temp, source_grid, target_grid, invertlev=False):
                 results[basename] = "ERROR: Soil Temperature Regridding failed"
                 continue
             fix_time_metadata(out_soil_temp, basename)
+            fix_soil_levels(out_soil_temp, is_temp=True)
+            final_st = str(out_soil_temp)
+
+        # 7. Final Validation on Generated GRIB2 Files
+        if input_file == input_files[0]:
+            check_final_gribs(
+                grib_3d=final_3d, 
+                grib_sfc=final_sfc, 
+                grib_soil_moist=final_sm, 
+                grib_soil_temp=final_st
+            )
             
         # Cleanup
-        if temp_3d.exists(): temp_3d.unlink()
+        if has_3d and temp_3d.exists(): temp_3d.unlink()
         if temp_sfc.exists(): temp_sfc.unlink()
         if temp_soil_moist.exists(): temp_soil_moist.unlink()
         if temp_soil_temp.exists(): temp_soil_temp.unlink()

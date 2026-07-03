@@ -185,13 +185,14 @@ def main():
     download_queue = {} # dir_name -> list of (target_dt, filename)
     
     current_longest_run = None
+    first_run_chosen = False
     
     for target in target_times:
-        # Strictly enforce offset > 0 to avoid +00h initialization files
-        valid_runs = [r for r in available_runs if r[0] < target and (target - r[0]).total_seconds() <= 48 * 3600]
+        # Allow offset >= 0 so we can grab initialization files
+        valid_runs = [r for r in available_runs if r[0] <= target and (target - r[0]).total_seconds() <= 48 * 3600]
         
         if not valid_runs:
-            print(f"[WARNING] No valid previous run covers {target} (skipping to avoid +00h initialization files).")
+            print(f"[WARNING] No valid previous run covers {target}.")
             continue
             
         if strategy == "1":
@@ -205,12 +206,23 @@ def main():
                 chosen_run_dt, dir_name = valid_runs[-1]
                 current_longest_run = valid_runs[-1]
                 
+        if not first_run_chosen:
+            # Automatically add the +00h init file for the very first simulation we use
+            init_file = get_filename_for_offset(0)
+            if dir_name not in download_queue:
+                download_queue[dir_name] = []
+            download_queue[dir_name].append((chosen_run_dt, init_file))
+            first_run_chosen = True
+                
         offset_hours = int((target - chosen_run_dt).total_seconds() // 3600)
         gz_file = get_filename_for_offset(offset_hours)
         
         if dir_name not in download_queue:
             download_queue[dir_name] = []
-        download_queue[dir_name].append((target, gz_file))
+            
+        # Avoid duplicating the init file if the user explicitly requested target == chosen_run_dt
+        if not (offset_hours == 0 and any(f[1] == gz_file for f in download_queue[dir_name])):
+            download_queue[dir_name].append((target, gz_file))
 
     if not download_queue:
         print("No files to download.")

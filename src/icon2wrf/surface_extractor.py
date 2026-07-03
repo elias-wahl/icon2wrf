@@ -18,6 +18,18 @@ def extract_surface(input_grib: str, output_nc: str) -> bool:
         if not dss:
             return False
         ds_sfc = max(dss, key=lambda d: len(d.data_vars))
+        
+        # cfgrib often splits HSURF into its own dataset. We must forcefully merge it back in!
+        for ds in dss:
+            for var in ['HSURF', 'orog', 'z']:
+                if var in ds.data_vars and var not in ds_sfc.data_vars:
+                    ds_sfc[var] = ds[var]
+        
+        # Force CDO to recognize HSURF as GRIB2 Parameter 6, Category 3, Discipline 0 (SOILHGT)
+        if 'HSURF' in ds_sfc.data_vars:
+            ds_sfc['HSURF'].attrs['param'] = '6.3.0'
+            ds_sfc['HSURF'].attrs.pop('GRIB_paramId', None)
+                    
         ds_sfc.to_netcdf(output_nc)
         print(f"Successfully saved surface fields to {output_nc}")
         return True
