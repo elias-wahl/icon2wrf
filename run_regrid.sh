@@ -19,11 +19,11 @@ if [ "$grid_choice" == "2" ]; then
     echo "Running make_grid.py to generate temporary grids..."
     python -m src.icon2wrf.make_grid "$source_file"
     echo ""
-    python -m src.icon2wrf.orchestrator --source-grid temp_source_grid.txt --target-grid temp_target_grid.txt --skip-file "$source_file"
+    python -m src.icon2wrf.orchestrator --source-grid temp_source_grid.txt --target-grid temp_target_grid.txt --skip-file "$source_file" "$@"
     
     # Clean up temporary grid files
     rm -f temp_source_grid.txt temp_target_grid.txt
 else
     echo ""
-    python -m src.icon2wrf.orchestrator
+    python -m src.icon2wrf.orchestrator "$@"
 fi

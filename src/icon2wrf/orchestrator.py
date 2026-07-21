@@ -18,15 +18,18 @@ except ImportError:
 from .surface_extractor import extract_surface, extract_3d, extract_soil_moist, extract_soil_temp
 from .diagnostics import check_wrf_ready, check_final_gribs
 
-def run_cdo_regrid(input_nc, output_grib, source_grid, target_grid, invertlev=False, extra_args=None):
-    """Runs CDO to regrid NetCDF to GRIB2, suppressing harmless ECCODES warnings."""
-    cmd = ["cdo", "-f", "grb2", "-b", "16", "-settunits,hours", "-setmisstonn"]
+def run_cdo_regrid(input_nc, output_file, source_grid, target_grid, invertlev=False, extra_args=None, as_netcdf=False):
+    """Runs CDO to regrid NetCDF, suppressing harmless ECCODES warnings."""
+    if as_netcdf:
+        cmd = ["cdo", "-f", "nc", "-settunits,hours", "-setmisstonn"]
+    else:
+        cmd = ["cdo", "-f", "grb2", "-b", "16", "-settunits,hours", "-setmisstonn"]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(f"-remapdis,{target_grid}")
     if invertlev:
         cmd.append("-invertlev")
-    cmd.extend([f"-setgrid,{source_grid}", str(input_nc), str(output_grib)])
+    cmd.extend([f"-setgrid,{source_grid}", str(input_nc), str(output_file)])
     
     print(f"Running: {' '.join(cmd)}")
     process = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -191,6 +194,7 @@ def main():
     parser.add_argument("--source-grid", help="Path to custom source grid file")
     parser.add_argument("--target-grid", help="Path to custom target grid file")
     parser.add_argument("--skip-file", help="Filename to skip (e.g. the domain file)")
+    parser.add_argument("--netcdf", action="store_true", help="Save output as NetCDF instead of GRIB2")
     args = parser.parse_args()
 
     config_path = "config/config.toml"
@@ -235,11 +239,12 @@ def main():
     
     for input_file in input_files:
         basename = input_file.name
-        out_3d = output_dir / f"{basename}_3d.grib2"
-        out_sfc = output_dir / f"{basename}_sfc.grib2"
+        ext = ".nc" if args.netcdf else ".grib2"
+        out_3d = output_dir / f"{basename}_3d{ext}"
+        out_sfc = output_dir / f"{basename}_sfc{ext}"
         
-        out_soil_moist = output_dir / f"{basename}_soil_moist.grib2"
-        out_soil_temp = output_dir / f"{basename}_soil_temp.grib2"
+        out_soil_moist = output_dir / f"{basename}_soil_moist{ext}"
+        out_soil_temp = output_dir / f"{basename}_soil_temp{ext}"
         
         # Determine what's already processed to avoid skipping if only some files were deleted
         if out_3d.exists() and out_sfc.exists() and out_soil_moist.exists() and out_soil_temp.exists():
@@ -297,40 +302,44 @@ def main():
         # 3. Regrid 3D fields
         if has_3d:
             print("\nRegridding 3D fields...")
-            if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True):
+            if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True, as_netcdf=args.netcdf):
                 results[basename] = "ERROR: 3D Regridding failed"
                 continue
-            fix_time_metadata(out_3d, basename)
+            if not args.netcdf:
+                fix_time_metadata(out_3d, basename)
             final_3d = str(out_3d)
             
         # 4. Regrid Surface fields
         print("\nRegridding Surface fields...")
-        if not run_cdo_regrid(temp_sfc, out_sfc, source_grid, target_grid, invertlev=False):
+        if not run_cdo_regrid(temp_sfc, out_sfc, source_grid, target_grid, invertlev=False, as_netcdf=args.netcdf):
             results[basename] = "ERROR: Surface Regridding failed"
             continue
-        fix_time_metadata(out_sfc, basename)
+        if not args.netcdf:
+            fix_time_metadata(out_sfc, basename)
         final_sfc = str(out_sfc)
             
         # 5. Regrid Soil fields if present
         if has_soil_moist:
             print("\nRegridding Soil Moisture fields...")
-            if not run_cdo_regrid(temp_soil_moist, out_soil_moist, source_grid, target_grid, invertlev=False):
+            if not run_cdo_regrid(temp_soil_moist, out_soil_moist, source_grid, target_grid, invertlev=False, as_netcdf=args.netcdf):
                 results[basename] = "ERROR: Soil Moisture Regridding failed"
                 continue
-            fix_time_metadata(out_soil_moist, basename)
-            fix_soil_levels(out_soil_moist, is_temp=False)
+            if not args.netcdf:
+                fix_time_metadata(out_soil_moist, basename)
+                fix_soil_levels(out_soil_moist, is_temp=False)
             final_sm = str(out_soil_moist)
         if has_soil_temp:
             print("\nRegridding Soil Temperature fields...")
-            if not run_cdo_regrid(temp_soil_temp, out_soil_temp, source_grid, target_grid, invertlev=False):
+            if not run_cdo_regrid(temp_soil_temp, out_soil_temp, source_grid, target_grid, invertlev=False, as_netcdf=args.netcdf):
                 results[basename] = "ERROR: Soil Temperature Regridding failed"
                 continue
-            fix_time_metadata(out_soil_temp, basename)
-            fix_soil_levels(out_soil_temp, is_temp=True)
+            if not args.netcdf:
+                fix_time_metadata(out_soil_temp, basename)
+                fix_soil_levels(out_soil_temp, is_temp=True)
             final_st = str(out_soil_temp)
 
         # 7. Final Validation on Generated GRIB2 Files
-        if input_file == input_files[0]:
+        if input_file == input_files[0] and not args.netcdf:
             check_final_gribs(
                 grib_3d=final_3d, 
                 grib_sfc=final_sfc, 
