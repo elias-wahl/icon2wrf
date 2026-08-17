@@ -177,7 +177,19 @@ def fix_soil_levels(grib_file, is_temp=True):
                             eccodes.codes_set(gid, 'typeOfSecondFixedSurface', 106)
                         except:
                             pass
-                            
+
+                        # ICON's W_SO is a layer-integrated mass (kg m-2), but
+                        # WRF's SMOIS is a volumetric fraction (m3 m-3).
+                        # Nothing downstream (metgrid, real.exe) converts this
+                        # generically -- WRF only has a hardcoded conversion
+                        # for UM-sourced soil moisture (flag_um_soil), which
+                        # ICON data does not set. Convert here, at the one
+                        # point where the exact layer thickness is known.
+                        thickness_m = depths_moist_bot[idx] - depths_moist_top[idx]
+                        vals = eccodes.codes_get_values(gid)
+                        vals = vals / (thickness_m * 1000.0)
+                        eccodes.codes_set_values(gid, vals)
+
                 eccodes.codes_write(gid, fout)
                 eccodes.codes_release(gid)
                 idx += 1
