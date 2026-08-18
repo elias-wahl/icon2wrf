@@ -102,3 +102,61 @@ def extract_soil_temp(input_grib: str, output_nc: str) -> bool:
     except Exception as e:
         print(f"Could not extract Soil Temperature fields: {e}")
         return False
+
+def extract_openamundsen_fields(input_grib: str, output_nc: str) -> bool:
+    print(f"Extracting openAMUNDSEN fields from {input_grib}...")
+    try:
+        vars_to_extract = {
+            167: '2t', 
+            165: '10u', 
+            166: '10v', 
+            260242: '2r', 
+            228228: 'tp', 
+            3066: 'sde', 
+            228141: 'sd', 
+            500480: 'ASWDIR_S', 
+            500481: 'ASWDIFD_S',
+            500000: 'alt'
+        }
+        vars_to_merge = []
+        
+        try:
+            import cfgrib
+            dss = cfgrib.open_datasets(input_grib)
+            for ds in dss:
+                for var_name, da in ds.data_vars.items():
+                    paramId = da.attrs.get('GRIB_paramId')
+                    shortName = da.attrs.get('GRIB_shortName', var_name)
+                    
+                    # Extract standard variables
+                    if paramId in vars_to_extract:
+                        expected_name = vars_to_extract[paramId]
+                        # Don't extract the same variable twice if it's duplicated across hypercubes
+                        if not any(v.name == expected_name for v in vars_to_merge):
+                            da = da.rename(expected_name)
+                            coords_to_drop = [c for c in da.coords if c not in ['time', 'step', 'valid_time', 'latitude', 'longitude', 'values']]
+                            da = da.drop_vars(coords_to_drop, errors='ignore')
+                            vars_to_merge.append(da)
+                            
+                    # Extract HSURF altitude as a special robust fallback
+                    elif paramId == 500000 or shortName == 'HSURF':
+                        if not any(v.name == 'alt' for v in vars_to_merge):
+                            da = da.rename('alt')
+                            coords_to_drop = [c for c in da.coords if c not in ['time', 'step', 'valid_time', 'latitude', 'longitude', 'values']]
+                            da = da.drop_vars(coords_to_drop, errors='ignore')
+                            vars_to_merge.append(da)
+        except Exception as e:
+            print(f"[ERROR] Failed to process {input_grib}: {e}")
+            pass
+        
+        if not vars_to_merge:
+            return False
+            
+        ds_out = xr.merge(vars_to_merge, compat='override')
+        
+        ds_out.to_netcdf(output_nc)
+        print(f"Successfully saved openAMUNDSEN fields to {output_nc}")
+        return True
+    except Exception as e:
+        print(f"Error extracting openAMUNDSEN fields: {e}")
+        return False
