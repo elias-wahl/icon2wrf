@@ -12,5 +12,9 @@ dependencies = [
     "cfgrib",
     "netCDF4",
     "scipy",
+    "pyproj",
     "tomli; python_version < '3.11'"
 ]
+
+[project.optional-dependencies]
+dev = ["pytest"]

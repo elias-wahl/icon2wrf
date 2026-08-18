@@ -3,6 +3,12 @@ import os
 import sys
 import subprocess
 import shutil
+import glob
+import copy
+import concurrent.futures
+import threading
+import multiprocessing
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Fallback for Python < 3.11
@@ -15,8 +21,51 @@ except ImportError:
         print("[ERROR] Please install tomli for Python < 3.11: pip install tomli")
         sys.exit(1)
 
-from .surface_extractor import extract_surface, extract_3d, extract_soil_moist, extract_soil_temp
+from .surface_extractor import extract_surface, extract_3d, extract_soil_moist, extract_soil_temp, extract_openamundsen_fields
 from .diagnostics import check_wrf_ready, check_final_gribs
+
+def process_chunk_wrapper(chunk_start, chunk_end, args, config, input_dir, output_dir, source_grid, target_grid, queue):
+    from .amundsen_runner import run_openamundsen_profile
+    import copy
+    import multiprocessing
+    import uuid
+    import os
+    import shutil
+    from pathlib import Path
+    
+    # Assign a worker ID dynamically from the process name
+    worker_id = multiprocessing.current_process().name.split('-')[-1]
+    
+    chunk_args = copy.copy(args)
+    chunk_args.start = chunk_start.strftime("%Y%m%d%H")
+    chunk_args.end = chunk_end.strftime("%Y%m%d%H")
+    if hasattr(chunk_args, 'output'):
+        chunk_args.output = None
+        
+    use_ramdisk = getattr(args, 'ramdisk', False)
+    real_output_dir = output_dir
+    ram_dir = None
+    
+    if use_ramdisk and os.path.exists("/dev/shm"):
+        ram_dir = Path("/dev/shm") / f"icon2wrf_ramdisk_{os.environ.get('USER', 'user')}_{worker_id}_{uuid.uuid4().hex[:8]}"
+        ram_dir.mkdir(parents=True, exist_ok=True)
+        input_dir = ram_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = ram_dir / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+    try:
+        run_openamundsen_profile(chunk_args, config, input_dir, output_dir, source_grid, target_grid, queue, worker_id)
+        
+        if use_ramdisk and ram_dir is not None:
+            expected_nc = f"openamundsen_forcing_{chunk_args.start}_{chunk_args.end}.nc"
+            ram_nc = output_dir / expected_nc
+            if ram_nc.exists():
+                shutil.copy(str(ram_nc), str(real_output_dir / expected_nc))
+                
+    finally:
+        if use_ramdisk and ram_dir is not None and ram_dir.exists():
+            shutil.rmtree(str(ram_dir), ignore_errors=True)
 
 def run_cdo_regrid(input_nc, output_file, source_grid, target_grid, invertlev=False, extra_args=None, as_netcdf=False):
     """Runs CDO to regrid NetCDF, suppressing harmless ECCODES warnings."""
@@ -207,6 +256,14 @@ def main():
     parser.add_argument("--target-grid", help="Path to custom target grid file")
     parser.add_argument("--skip-file", help="Filename to skip (e.g. the domain file)")
     parser.add_argument("--netcdf", action="store_true", help="Save output as NetCDF instead of GRIB2")
+    parser.add_argument("--profile", choices=["wrf", "openamundsen"], default="wrf", help="Which processing profile to run")
+    parser.add_argument("--output", help="Output filename for openamundsen profile")
+    parser.add_argument("--start", help="Start date/time (YYYYMMDDHH)")
+    parser.add_argument("--end", help="End date/time (YYYYMMDDHH)")
+    parser.add_argument("--run-strategy", choices=["freshest", "longest"], default="freshest", help="Forecast stitching strategy")
+    parser.add_argument("--spinup", type=int, default=9, help="Minimum lead time (hours) to use, avoiding forecast spin-up shock (default: 9)")
+    parser.add_argument("--jobs", type=int, default=8, help="Number of concurrent workers for parallel chunking in interactive sessions (default: 8)")
+    parser.add_argument("--ramdisk", action="store_true", help="Use /dev/shm to aggressively isolate chunking in RAM (streaming mode only)")
     args = parser.parse_args()
 
     config_path = "config/config.toml"
@@ -227,11 +284,152 @@ def main():
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Clean up old idx files to improve cfgrib run time
+    for d in [input_dir, output_dir]:
+        for idx_file in d.glob("*.idx"):
+            try:
+                idx_file.unlink()
+            except Exception:
+                pass
+    
     # Ensure grid files exist
     if not os.path.exists(source_grid) or not os.path.exists(target_grid):
         print(f"[ERROR] Grid definitions not found: {source_grid} or {target_grid}")
         sys.exit(1)
-     # Gather all unique timestamps/basenames
+        
+    if args.profile == "openamundsen":
+        from .amundsen_runner import run_openamundsen_profile, ensure_oetztal_grid
+        from .download_ftp import load_credentials
+        
+        # Sequentially ensure the target grid exists so 8 workers don't collide trying to create it
+        ensure_oetztal_grid()
+        
+        # Sequentially prompt for FTP password if needed, preventing 8 workers from blocking on stdin
+        if args.start and args.end:
+            creds = load_credentials()
+            url = creds.get("url")
+            username = creds.get("username")
+            if url and username and not os.environ.get("FTP_PASSWORD"):
+                import getpass
+                pwd = getpass.getpass(f"Password for {username}@{url}: ")
+                os.environ["FTP_PASSWORD"] = pwd
+                
+            print("\nPerforming pre-flight FTP validation and extracting missing targets...")
+            import ftplib
+            from .amundsen_runner import build_download_queue
+            missing_targets = set()
+            try:
+                with ftplib.FTP(url) as ftp:
+                    ftp.login(username, os.environ.get("FTP_PASSWORD"))
+                    master_queue = build_download_queue(ftp, datetime.strptime(args.start, "%Y%m%d%H"), datetime.strptime(args.end, "%Y%m%d%H"), args.run_strategy, spinup_hours=args.spinup, log=lambda x: None)
+                    for dir_name, items in master_queue.items():
+                        if dir_name.startswith("COPY_LAST_DIR"):
+                            for target, _, _ in items:
+                                missing_targets.add(target)
+            except ValueError as e:
+                print(f"\n[FATAL ERROR] {e}")
+                sys.exit(1)
+            except Exception as e:
+                print(f"\n[FATAL ERROR] FTP Connection Failed: {e}")
+                sys.exit(1)
+                
+        if args.start and args.end:
+            start_dt = datetime.strptime(args.start, "%Y%m%d%H")
+            end_dt = datetime.strptime(args.end, "%Y%m%d%H")
+            
+            all_targets = []
+            curr = start_dt
+            while curr <= end_dt:
+                all_targets.append(curr)
+                curr += timedelta(hours=1)
+                
+            chunk_size_ideal = len(all_targets) / args.jobs
+            chunks = []
+            current_idx = 0
+            
+            for i in range(args.jobs):
+                if current_idx >= len(all_targets): break
+                
+                # If last job, take the remainder
+                if i == args.jobs - 1:
+                    chunks.append((all_targets[current_idx], all_targets[-1]))
+                    break
+                    
+                end_idx = int((i + 1) * chunk_size_ideal) - 1
+                if end_idx >= len(all_targets):
+                    end_idx = len(all_targets) - 1
+                    
+                # Ensure chunk doesn't end on a missing target (pushes the boundary to the next valid file for interpolation)
+                while end_idx < len(all_targets) - 1 and all_targets[end_idx] in missing_targets:
+                    end_idx += 1
+                    
+                chunks.append((all_targets[current_idx], all_targets[end_idx]))
+                current_idx = end_idx + 1
+                
+            print(f"\n==========================================================")
+            print(f"Parallelizing openAMUNDSEN season into {len(chunks)} chunk(s)")
+            print(f"Dispatching to {args.jobs} concurrent workers...")
+            print(f"==========================================================\n")
+            
+            from .progress import ProgressTracker
+            m = multiprocessing.Manager()
+            q = m.Queue()
+            tracker = ProgressTracker(q)
+            ui_thread = threading.Thread(target=tracker.monitor, daemon=True)
+            ui_thread.start()
+            
+            with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as executor:
+                futures = [executor.submit(process_chunk_wrapper, c[0], c[1], args, config, input_dir, output_dir, source_grid, target_grid, q) for c in chunks]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        q.put({"type": "LOG", "worker_id": "?", "msg": f"Chunk failed: {e}"})
+                        
+            q.put({"type": "STOP"})
+            ui_thread.join(timeout=2.0)
+                        
+            # Final mergetime stitch
+            print(f"\nStitching chunks together...")
+            output_name = args.output if args.output else f"openamundsen_forcing_{args.start}_{args.end}.nc"
+            final_nc = output_dir / output_name
+            
+            chunk_files = []
+            for c in chunks:
+                start_str = c[0].strftime("%Y%m%d%H")
+                end_str = c[1].strftime("%Y%m%d%H")
+                expected_nc = str(output_dir / f"openamundsen_forcing_{start_str}_{end_str}.nc")
+                if os.path.exists(expected_nc):
+                    chunk_files.append(expected_nc)
+            
+            if len(chunk_files) > 0:
+                if len(chunk_files) == 1 and chunk_files[0] == str(final_nc):
+                    print(f"\nSingle chunk generated. No merge needed: {final_nc}")
+                else:
+                    try:
+                        subprocess.run(["cdo", "-s", "-O", "mergetime"] + chunk_files + [str(final_nc)], check=True, capture_output=True, text=True)
+                        print(f"\nSuccessfully created final season file: {final_nc}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"\n[CDO MERGETIME ERROR]")
+                        print(f"STDERR:\n{e.stderr}")
+                        raise
+                        
+                    # Clean up chunk files
+                    for f in chunk_files:
+                        if f != str(final_nc):
+                            try:
+                                os.remove(f)
+                            except:
+                                pass
+            else:
+                print("[FATAL ERROR] No output chunks found to merge. All worker chunks failed.")
+                sys.exit(1)
+
+        else:
+            run_openamundsen_profile(args, config, input_dir, output_dir, source_grid, target_grid)
+        return
+
+    # Gather all unique timestamps/basenames
     input_files = []
     for f in input_dir.iterdir():
         if f.is_file() and not f.name.endswith(".idx"):
