@@ -19,8 +19,15 @@ isf*
 # Log files
 *.log
 
+# SLURM job logs
+season_*.out
+season_*.err
+devel_test_*.out
+devel_test_*.err
+
 # Secrets/Credentials
 credentials.toml
+.ftp_pass
 
 # Archive
 archive/
