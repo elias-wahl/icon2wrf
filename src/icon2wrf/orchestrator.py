@@ -21,7 +21,7 @@ except ImportError:
         print("[ERROR] Please install tomli for Python < 3.11: pip install tomli")
         sys.exit(1)
 
-from .surface_extractor import extract_surface, extract_3d, extract_soil_moist, extract_soil_temp, extract_openamundsen_fields
+from .surface_extractor import extract_surface, extract_3d, extract_3d_ml, extract_soil_moist, extract_soil_temp, extract_openamundsen_fields
 from .diagnostics import check_wrf_ready, check_final_gribs
 
 def process_chunk_wrapper(chunk_start, chunk_end, args, config, input_dir, output_dir, source_grid, target_grid, queue):
@@ -256,6 +256,8 @@ def main():
     parser.add_argument("--target-grid", help="Path to custom target grid file")
     parser.add_argument("--skip-file", help="Filename to skip (e.g. the domain file)")
     parser.add_argument("--netcdf", action="store_true", help="Save output as NetCDF instead of GRIB2")
+    parser.add_argument("--ml-plevs", action="store_true", help="Build the 3D fields from the 65 ICON model levels onto a dense pressure ladder (A19/A21 fix) instead of the 11 diagnostic pressure levels")
+    parser.add_argument("--out-dir", help="Override the output directory (keeps the default product untouched)")
     parser.add_argument("--profile", choices=["wrf", "openamundsen"], default="wrf", help="Which processing profile to run")
     parser.add_argument("--output", help="Output filename for openamundsen profile")
     parser.add_argument("--start", help="Start date/time (YYYYMMDDHH)")
@@ -277,6 +279,9 @@ def main():
     paths = config.get("paths", {})
     input_dir = Path(paths.get("input_dir", "input"))
     output_dir = Path(paths.get("output_dir", "output"))
+    if getattr(args, "out_dir", None):
+        output_dir = Path(args.out_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
     
     source_grid = args.source_grid if args.source_grid else paths.get("source_grid", "source_grid.txt")
     target_grid = args.target_grid if args.target_grid else paths.get("target_grid", "target_grid.txt")
@@ -472,7 +477,12 @@ def main():
         # These are now defined above, so just keep the temp files here
         
         # 1. Extract NetCDFs using Python (Bypasses AEC compression errors)
-        has_3d = extract_3d(str(input_file), str(temp_3d))
+        if getattr(args, "ml_plevs", False):
+            lead0 = sorted(Path(input_dir).glob("*_ilf3f00000000"))
+            has_3d = extract_3d_ml(str(input_file), str(lead0[0]), str(temp_3d)) if lead0 else False
+            if not lead0: print("[ERROR] --ml-plevs needs the lead-0 file (*_ilf3f00000000) for HHL")
+        else:
+            has_3d = extract_3d(str(input_file), str(temp_3d))
         if not has_3d:
             if basename.endswith("00000000"):
                 print(f"[INFO] Initial file {basename} lacks 3D fields. Proceeding with surface data only.")
