@@ -20,10 +20,16 @@ def extract_surface(input_grib: str, output_nc: str) -> bool:
         ds_sfc = max(dss, key=lambda d: len(d.data_vars))
         
         # cfgrib often splits HSURF into its own dataset. We must forcefully merge it back in!
+        # NOTE (2026-09-03, KNOWN_ISSUES E39): 'z' was in this list and pulled ICON's geopotential on the
+        # 11 ISOBARIC levels into the *surface* product; ungrib (Vtable.ICONp) then merged it into GHT and,
+        # with a 3-D product on other levels (ladder/native), metgrid aborted ("num_metgrid_levels REDEFINED
+        # by var GHT"). Only true surface fields belong here; SOILHGT comes from HSURF/orog.
         for ds in dss:
-            for var in ['HSURF', 'orog', 'z']:
+            for var in ['HSURF', 'orog']:
                 if var in ds.data_vars and var not in ds_sfc.data_vars:
                     ds_sfc[var] = ds[var]
+        if 'z' in ds_sfc.data_vars and 'isobaricInhPa' in ds_sfc['z'].dims:
+            ds_sfc = ds_sfc.drop_vars('z')
         
         # Force CDO to recognize HSURF as GRIB2 Parameter 6, Category 3, Discipline 0 (SOILHGT)
         if 'HSURF' in ds_sfc.data_vars:
