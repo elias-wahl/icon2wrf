@@ -259,3 +259,44 @@ def extract_3d_ml(input_grib: str, lead0_grib: str, output_nc: str, plevs_hpa=No
         import traceback; traceback.print_exc()
         print(f"Error in extract_3d_ml: {e}")
         return False
+
+
+def extract_3d_native(input_grib: str, lead0_grib: str, output_nc: str) -> bool:
+    """Pass the 65 ICON model levels through untouched (t,u,v,q,pres + geometric height h).
+    For WPS Vtable.ICONm (GRIB2 level type 150 = generalVertical, level = ICON layer index,
+    1 = top); ungrib maps 150 to hybrid and metgrid/real use PRESSURE and HGT per level.
+    Default vertical mode since 2026-09-03 (Elias): no interpolation, no invented levels."""
+    import numpy as np
+    print(f"Extracting 3D fields on the NATIVE 65 model levels of {input_grib}...")
+    try:
+        ml = xr.open_dataset(input_grib, engine="cfgrib",
+                             backend_kwargs={"filter_by_keys": {"typeOfLevel": "generalVerticalLayer"}})
+        need = ["u", "v", "t", "q", "pres"]
+        if any(n not in ml.data_vars for n in need):
+            print(f"  -> model-level fields missing ({[n for n in need if n not in ml.data_vars]})")
+            return False
+        hhl = xr.open_dataset(lead0_grib, engine="cfgrib",
+                              backend_kwargs={"filter_by_keys": {"shortName": "HHL"}})["HHL"].values  # (66, N), 1 = top
+        lev = ml["generalVerticalLayer"].values.astype(np.float64)            # 1..65, top first
+        order = np.argsort(lev)
+        zf = (0.5 * (hhl[:-1] + hhl[1:])).astype(np.float32)                  # full-level geometric height, index 0 = layer 1
+        N = zf.shape[1]
+        coords = {"generalVerticalLayer": ("generalVerticalLayer", lev[order],
+                                           {"long_name": "ICON model layer (1 = top)", "units": "1", "axis": "Z", "positive": "down"}),
+                  "values": ("values", np.arange(N))}
+        for c in ("time", "step", "valid_time"):
+            if c in ml.coords:
+                coords[c] = ml[c]
+        data = {k: (("generalVerticalLayer", "values"), ml[k].values[order].astype(np.float32), dict(ml[k].attrs)) for k in need}
+        data["h"] = (("generalVerticalLayer", "values"), zf[order.astype(int)] if lev[order][0] == 1 else zf[::-1],
+                     {"long_name": "Geometrical height", "units": "m", "GRIB_shortName": "h", "GRIB_paramId": 3006,
+                      "GRIB_discipline": 0, "GRIB_parameterCategory": 3, "GRIB_parameterNumber": 6})
+        ds = xr.Dataset(data, coords=coords, attrs=dict(ml.attrs))
+        ds.attrs["history"] = ds.attrs.get("history", "") + " | icon2wrf extract_3d_native: 65 ICON model levels, no vertical interpolation (2026-09-03)"
+        ds.to_netcdf(output_nc)
+        print(f"Successfully saved native model-level 3D fields (65 levels: t,u,v,q,pres,h) to {output_nc}")
+        return True
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"Error in extract_3d_native: {e}")
+        return False
