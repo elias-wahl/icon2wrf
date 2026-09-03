@@ -102,6 +102,8 @@ Once the above is in place: `sbatch submit_season_devel_test.sh` first as a smok
 The model-level fields are CCSDS/AEC-packed; cdo cannot decode them (KNOWN_ISSUES E38), python-eccodes/cfgrib can — hence the Python extraction step.
 The SFC and ICON_INIT ungrib steps must use a Vtable **without** 3-D rows (`Vtable.ICONsfc`) for surface files made before commit `9069aee`, which carried isobaric geopotential (KNOWN_ISSUES E39).
 
+WPS Vtables for all three modes are kept in `vtables/`: `Vtable.ICONm` (native model levels, GRIB2 level type 150), `Vtable.ICONp` (pressure levels: ladder and isobaric), `Vtable.ICONsfc` (surface/soil steps, 2-D rows only). Copy them to `WPS/ungrib/Variable_Tables/`.
+
 ## Under the Hood (Technical Details)
 This package includes several advanced fail-safes and workarounds specific to processing complex ICON data for WRF:
 - **AEC Compression Bypass**: The script uses `xarray` and `cfgrib` in Python to extract the GRIB fields first, bypassing the notorious `eccodes` AEC compression errors that often cause standard CDO binaries or Docker containers to crash on ICON data.
