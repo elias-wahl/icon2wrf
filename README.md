@@ -63,6 +63,44 @@ pip install -e .
 
 > **Note on WRF Vtables**: If you are using an older version of WRF/WPS that does not natively include the Vtables for ICON, we have included `Vtable.ICONp` and `Vtable.ICONm` in the `vtables/` directory of this repository! You can simply copy or symlink them to your WPS folder.
 
+## Deploying on a New Cluster (openAMUNDSEN Season Runs)
+
+
+1. **FTP credentials**: create `config/credentials.toml` with your FTP URL and username (or add an `[ftp]` section to `config/config.toml`):
+   ```toml
+   [ftp]
+   url = "your.ftp.server"
+   username = "your_username"
+   ```
+   Without this, the season scripts fail immediately with `FATAL ERROR: FTP Connection Failed` — they only prompt interactively for the *password*, not the URL/username.
+2. **FTP password**: create a `.ftp_pass` file (gitignored) in the repo root containing just the plaintext password, or export `FTP_PASSWORD` yourself before submitting the job.
+3. **Python environment**: create/activate a conda env (the scripts assume it's named `icon`) and install this package and its dependencies:
+   ```bash
+   conda create -n icon python=3.11
+   conda activate icon
+   conda install -c conda-forge cdo
+   pip install -e .
+   ```
+4. **CDO module**: the submit scripts run `module load cdo` before activating conda — if the new cluster doesn't have a `cdo` environment module, remove that line and rely on the conda-installed `cdo` binary instead.
+5. **SLURM partition/QoS names**: `submit_season_32cores.sh` and `submit_season_devel_test.sh` hardcode `--partition=zen3_0512` and `--qos=zen3_0512*`, which are specific to this cluster's queue names. Update those (and `--mail-user`) to match the new cluster before submitting.
+
+`config/config.toml`, `source_grid.txt` and `target_grid.txt` are tracked in git and come with the clone as-is; `config/oetztal_grid.nc` is gitignored but self-generates on first run via `ensure_oetztal_grid()`, so no action is needed there.
+
+Once the above is in place: `sbatch submit_season_devel_test.sh` first as a smoke test (10 min wall time, same config as production), then `sbatch submit_season_32cores.sh` for the full season run.
+
+## Vertical modes of the 3-D product (2026-09-03)
+
+`python -m src.icon2wrf.orchestrator [--vertical native|plevs|isobaric] [--out-dir DIR]`
+
+| mode | source | levels written | WPS Vtable (3-D step) | notes |
+|---|---|---|---|---|
+| `native` (**default**) | 65 ICON model levels (`generalVerticalLayer`, needs the lead-0 file for HHL) | 65, untouched: t, u, v, q, pres, h (geometric height) on GRIB2 level type 150 | `Vtable.ICONm` | no vertical interpolation; ~880 MB/h; metgrid/real use PRESSURE and HGT per level (validated 2026-09-03: met_em 66 levels, real.exe OK) |
+| `plevs` (alias `--ml-plevs`) | same 65 model levels | 36 pressure levels: 10 hPa steps 1000–800, 20 hPa to 700, 50 hPa to 200; linear in ln p per column, hypsometric extrapolation below the lowest layer | `Vtable.ICONp` | ~410 MB/h; the A21 fix run X12 |
+| `isobaric` | ICON's own 11 diagnostic pressure levels (1000 … 200 hPa) | 11: z, t, r, u, v, w | `Vtable.ICONp` | the pre-2026-09 product; nothing between ~584 and ~1522 m ASL (branko/OPEN_ISSUES A19/A21) |
+
+The model-level fields are CCSDS/AEC-packed; cdo cannot decode them (KNOWN_ISSUES E38), python-eccodes/cfgrib can — hence the Python extraction step.
+The SFC and ICON_INIT ungrib steps must use a Vtable **without** 3-D rows (`Vtable.ICONsfc`) for surface files made before commit `9069aee`, which carried isobaric geopotential (KNOWN_ISSUES E39).
+
 ## Under the Hood (Technical Details)
 This package includes several advanced fail-safes and workarounds specific to processing complex ICON data for WRF:
 - **AEC Compression Bypass**: The script uses `xarray` and `cfgrib` in Python to extract the GRIB fields first, bypassing the notorious `eccodes` AEC compression errors that often cause standard CDO binaries or Docker containers to crash on ICON data.
