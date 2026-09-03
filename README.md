@@ -63,30 +63,6 @@ pip install -e .
 
 > **Note on WRF Vtables**: If you are using an older version of WRF/WPS that does not natively include the Vtables for ICON, we have included `Vtable.ICONp` and `Vtable.ICONm` in the `vtables/` directory of this repository! You can simply copy or symlink them to your WPS folder.
 
-## Deploying on a New Cluster (openAMUNDSEN Season Runs)
-
-
-1. **FTP credentials**: create `config/credentials.toml` with your FTP URL and username (or add an `[ftp]` section to `config/config.toml`):
-   ```toml
-   [ftp]
-   url = "your.ftp.server"
-   username = "your_username"
-   ```
-   Without this, the season scripts fail immediately with `FATAL ERROR: FTP Connection Failed` — they only prompt interactively for the *password*, not the URL/username.
-2. **FTP password**: create a `.ftp_pass` file (gitignored) in the repo root containing just the plaintext password, or export `FTP_PASSWORD` yourself before submitting the job.
-3. **Python environment**: create/activate a conda env (the scripts assume it's named `icon`) and install this package and its dependencies:
-   ```bash
-   conda create -n icon python=3.11
-   conda activate icon
-   conda install -c conda-forge cdo
-   pip install -e .
-   ```
-4. **CDO module**: the submit scripts run `module load cdo` before activating conda — if the new cluster doesn't have a `cdo` environment module, remove that line and rely on the conda-installed `cdo` binary instead.
-5. **SLURM partition/QoS names**: `submit_season_32cores.sh` and `submit_season_devel_test.sh` hardcode `--partition=zen3_0512` and `--qos=zen3_0512*`, which are specific to this cluster's queue names. Update those (and `--mail-user`) to match the new cluster before submitting.
-
-`config/config.toml`, `source_grid.txt` and `target_grid.txt` are tracked in git and come with the clone as-is; `config/oetztal_grid.nc` is gitignored but self-generates on first run via `ensure_oetztal_grid()`, so no action is needed there.
-
-Once the above is in place: `sbatch submit_season_devel_test.sh` first as a smoke test (10 min wall time, same config as production), then `sbatch submit_season_32cores.sh` for the full season run.
 
 ## Vertical modes of the 3-D product (2026-09-03)
 
