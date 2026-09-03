@@ -206,7 +206,12 @@ def main():
     parser.add_argument("--target-grid", help="Path to custom target grid file")
     parser.add_argument("--skip-file", help="Filename to skip (e.g. the domain file)")
     parser.add_argument("--netcdf", action="store_true", help="Save output as NetCDF instead of GRIB2")
-    parser.add_argument("--ml-plevs", action="store_true", help="Build the 3D fields from the 65 ICON model levels onto a dense pressure ladder (A19/A21 fix) instead of the 11 diagnostic pressure levels")
+    parser.add_argument("--vertical", choices=["native", "plevs", "isobaric"], default="native",
+                        help="3D vertical mode (default native, 2026-09-03): native = the 65 ICON model levels untouched "
+                             "(WPS Vtable.ICONm); plevs = model levels interpolated in ln p onto a 36-level pressure ladder "
+                             "(Vtable.ICONp; the A21 fix run X12); isobaric = ICON's own 11 diagnostic pressure levels "
+                             "(the pre-2026-09 product; 940 m gap across the valley, OPEN_ISSUES A19/A21)")
+    parser.add_argument("--ml-plevs", action="store_true", help="alias for --vertical plevs")
     parser.add_argument("--out-dir", help="Override the output directory (keeps the default product untouched)")
     args = parser.parse_args()
 
@@ -278,10 +283,16 @@ def main():
         # These are now defined above, so just keep the temp files here
         
         # 1. Extract NetCDFs using Python (Bypasses AEC compression errors)
-        if getattr(args, "ml_plevs", False):
+        vmode = "plevs" if getattr(args, "ml_plevs", False) else getattr(args, "vertical", "native")
+        if vmode in ("native", "plevs"):
             lead0 = sorted(Path(input_dir).glob("*_ilf3f00000000"))
-            has_3d = extract_3d_ml(str(input_file), str(lead0[0]), str(temp_3d)) if lead0 else False
-            if not lead0: print("[ERROR] --ml-plevs needs the lead-0 file (*_ilf3f00000000) for HHL")
+            if not lead0:
+                print(f"[ERROR] --vertical {vmode} needs the lead-0 file (*_ilf3f00000000) for HHL")
+                has_3d = False
+            elif vmode == "native":
+                has_3d = extract_3d_native(str(input_file), str(lead0[0]), str(temp_3d))
+            else:
+                has_3d = extract_3d_ml(str(input_file), str(lead0[0]), str(temp_3d))
         else:
             has_3d = extract_3d(str(input_file), str(temp_3d))
         if not has_3d:
@@ -303,7 +314,10 @@ def main():
             
         # 2. Run Diagnostics
         print("\nRunning Diagnostics...")
-        if has_3d:
+        if has_3d and vmode == "native":
+            print("[INFO] native model levels: isobaric diagnostics skipped (WPS: Vtable.ICONm)")
+            vtables_found.add("Vtable.ICONm")
+        elif has_3d:
             diag_ok, vtable_sugg = check_wrf_ready(str(temp_3d), str(temp_sfc), soil_files=soil_files_for_diag)
             if not diag_ok:
                 print("[ERROR] Diagnostics failed.")
@@ -323,7 +337,8 @@ def main():
         # 3. Regrid 3D fields
         if has_3d:
             print("\nRegridding 3D fields...")
-            if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=True, as_netcdf=args.netcdf):
+            zax = [f"-setzaxis,{Path(__file__).resolve().parents[2] / 'config' / 'zaxis_icon_ml.txt'}"] if vmode == "native" else None
+            if not run_cdo_regrid(temp_3d, out_3d, source_grid, target_grid, invertlev=(vmode != "native"), extra_args=zax, as_netcdf=args.netcdf):
                 results[basename] = "ERROR: 3D Regridding failed"
                 continue
             if not args.netcdf:
