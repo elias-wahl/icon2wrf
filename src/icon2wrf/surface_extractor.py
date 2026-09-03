@@ -102,3 +102,92 @@ def extract_soil_temp(input_grib: str, output_nc: str) -> bool:
     except Exception as e:
         print(f"Could not extract Soil Temperature fields: {e}")
         return False
+
+
+ML_PLEVS_HPA = [1000, 990, 980, 970, 960, 950, 940, 930, 920, 910, 900, 890, 880,
+                870, 860, 850, 840, 830, 820, 810, 800, 780, 760, 740, 720, 700,
+                650, 600, 550, 500, 450, 400, 350, 300, 250, 200]
+
+
+def _rh_from_q(q, T, p):
+    import numpy as np
+    e = q * p / (0.622 + 0.378 * q)
+    es = 611.2 * np.exp(17.67 * (T - 273.15) / (T - 29.65))
+    return np.clip(100.0 * e / es, 0.0, 100.0)
+
+
+def extract_3d_ml(input_grib: str, lead0_grib: str, output_nc: str, plevs_hpa=None) -> bool:
+    """Build z,t,r,u,v on dense pressure levels from the ICON model levels."""
+    import numpy as np
+    plevs_hpa = plevs_hpa or ML_PLEVS_HPA
+    print(f"Extracting 3D fields from MODEL LEVELS of {input_grib} -> {len(plevs_hpa)} pressure levels...")
+    try:
+        kw = dict(engine="cfgrib", backend_kwargs={"filter_by_keys": {"typeOfLevel": "generalVerticalLayer"}})
+        ml = xr.open_dataset(input_grib, **kw)
+        need = ["u", "v", "t", "q", "pres"]
+        if any(n not in ml.data_vars for n in need):
+            print(f"  -> model-level fields missing ({[n for n in need if n not in ml.data_vars]})")
+            return False
+        hhl = xr.open_dataset(lead0_grib, engine="cfgrib",
+                              backend_kwargs={"filter_by_keys": {"shortName": "HHL"}})["HHL"].values  # (66, N), 1 = top
+        tmpl = xr.open_dataset(input_grib, engine="cfgrib",
+                               backend_kwargs={"filter_by_keys": {"typeOfLevel": "isobaricInhPa"}})
+
+        # bottom-first ordering (index 0 = lowest layer = ICON layer 65)
+        order = np.argsort(ml["generalVerticalLayer"].values)[::-1]
+        p = ml["pres"].values[order].astype(np.float64)          # Pa, decreasing along axis 0
+        T = ml["t"].values[order].astype(np.float64)
+        q = ml["q"].values[order].astype(np.float64)
+        u = ml["u"].values[order].astype(np.float64)
+        v = ml["v"].values[order].astype(np.float64)
+        zf = 0.5 * (hhl[:-1] + hhl[1:])                           # full-level heights, 1 = top
+        zf = zf[::-1]                                             # bottom-first, matches `order`
+        lnp = np.log(p)
+        N = p.shape[1]
+        RD, G, GAMMA = 287.05, 9.80665, 0.0065
+
+        out = {k: np.empty((len(plevs_hpa), N), dtype=np.float32) for k in ("z", "t", "r", "u", "v")}
+        for li, ph in enumerate(plevs_hpa):
+            pt = ph * 100.0
+            lnpt = np.log(pt)
+            k = (p > pt).sum(axis=0)                              # first level with p <= pt
+            below = k == 0                                        # target under the lowest layer
+            top = k >= p.shape[0]
+            lo = np.clip(k - 1, 0, p.shape[0] - 2)
+            hi = lo + 1
+            def gat(a, idx):
+                return np.take_along_axis(a, idx[None, :], axis=0)[0]
+            w = (lnpt - gat(lnp, lo)) / (gat(lnp, hi) - gat(lnp, lo))
+            w = np.where(top, 1.0, w)
+            def lin(a):
+                return gat(a, lo) + w * (gat(a, hi) - gat(a, lo))
+            Tt, ut, vt, qt, zt = lin(T), lin(u), lin(v), lin(q), lin(zf)
+            if below.any():                                       # hypsometric extrapolation downward
+                T0, z0, p0 = T[0][below], zf[0][below], p[0][below]
+                zb = z0 - RD * T0 / G * np.log(pt / p0)
+                zt[below] = zb
+                Tt[below] = T0 + GAMMA * (z0 - zb)
+                ut[below], vt[below], qt[below] = u[0][below], v[0][below], q[0][below]
+            out["z"][li] = (G * zt).astype(np.float32)
+            out["t"][li] = Tt
+            out["r"][li] = _rh_from_q(qt, Tt, pt)
+            out["u"][li] = ut
+            out["v"][li] = vt
+
+        coords = {"isobaricInhPa": ("isobaricInhPa", np.array(plevs_hpa, dtype=np.float64), dict(tmpl["isobaricInhPa"].attrs)),
+                  "values": ("values", np.arange(N))}
+        for c in ("time", "step", "valid_time"):
+            if c in ml.coords:
+                coords[c] = ml[c]
+        ds = xr.Dataset({k: (("isobaricInhPa", "values"), out[k]) for k in out}, coords=coords, attrs=dict(tmpl.attrs))
+        for k in out:
+            if k in tmpl.data_vars:
+                ds[k].attrs = dict(tmpl[k].attrs)
+        ds.attrs["history"] = ds.attrs.get("history", "") + " | icon2wrf extract_3d_ml: 65 model levels -> dense plevs (2026-09-02)"
+        ds.to_netcdf(output_nc)
+        print(f"Successfully saved model-level-derived 3D fields ({len(plevs_hpa)} levels) to {output_nc}")
+        return True
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"Error in extract_3d_ml: {e}")
+        return False
