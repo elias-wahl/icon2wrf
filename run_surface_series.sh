@@ -10,7 +10,8 @@
 # per-IP connection cap) splits the range into equal chunks that run in parallel; the chunks are
 # merged with `cdo mergetime`. WRFINPUT (5th arg, or $WRFINPUT, default: the production domain's
 # wrfinput below) confines the output to that WRF mass grid (south_north x west_east, HRLDAS-ready);
-# pass "none" for the full lon-lat product grid. Fields, stitching rule, units: src/icon2wrf/surface_series.py.
+# a CDO grid description .txt works too (config/wrf_grid_wrfinput_d01_innval_pbl3d_X16b.txt is the
+# production grid, committed, so no wrfinput is needed on another machine); "none" = full product grid. Fields, stitching rule, units: src/icon2wrf/surface_series.py.
 # Needs: `module load cdo`, the `icon` conda env, config/credentials.toml, and the FTP password in
 # .ftp_pass (git-ignored). Run from the icon2wrf root, on the login node or inside a SLURM job.
 set -u
@@ -18,7 +19,11 @@ cd "$(dirname "$0")"
 START=${1:?START YYYYMMDDHH}; END=${2:?END YYYYMMDDHH}
 OUT=${3:-output/icon_surface_${START}_${END}.nc}; JOBS=${4:-4}
 WRFINPUT=${5:-${WRFINPUT:-/gpfs/data/fs72996/ewahl/branko_runs/innval_pbl3d_X16b/wrfinput_d01}}
-GRIDARG=(); [ "$WRFINPUT" != "none" ] && { [ -f "$WRFINPUT" ] || { echo "WRFINPUT not found: $WRFINPUT"; exit 1; }; GRIDARG=(--wrf-grid "$WRFINPUT"); }
+GRIDARG=()
+if [ "$WRFINPUT" != "none" ]; then
+    [ -f "$WRFINPUT" ] || { echo "grid source not found: $WRFINPUT  (pass a wrfinput_d01, a CDO grid description .txt such as config/wrf_grid_wrfinput_d01_innval_pbl3d_X16b.txt, or 'none')"; exit 1; }
+    case "$WRFINPUT" in *.txt) GRIDARG=(--target-grid "$WRFINPUT");; *) GRIDARG=(--wrf-grid "$WRFINPUT");; esac
+fi
 [ "$JOBS" -gt 8 ] && JOBS=8
 
 module load cdo >/dev/null 2>&1 || true

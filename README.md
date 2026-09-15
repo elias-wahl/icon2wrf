@@ -95,5 +95,8 @@ RAINRATE` — plus ICON's own `TG SHFLX LHFLX TSOIL(9 depths) WSOIL(8 layers) SN
 Run-cumulative fields are de-averaged/differenced against the previous lead of the same run; the
 stitching rule is "freshest run with lead >= 9 h" (`--spinup`); `LWDOWN = net LW + sigma*TG^4`.
 Ported from branch `icon2amundsen` (download-filter-delete) and reduced: `src/icon2wrf/surface_series.py`.
+By default the output is confined to the production WRF mass grid (500 x 600; 5th argument = a wrfinput_d01
+or the committed `config/wrf_grid_wrfinput_d01_innval_pbl3d_X16b.txt`; `none` = full product grid, 3.8x larger).
 Smoke test: `./run_surface_series.sh 2025071712 2025071715 /tmp/test.nc 1` (~90 s per hour, download-bound).
+Three-month spin-up forcing: `./run_surface_series.sh 2025040100 2025071800 output/icon_surface_2025040100_2025071800.nc 8`.
 Motivation: OPEN_ISSUES A28 (the ICON soil state) in the WRF project.
