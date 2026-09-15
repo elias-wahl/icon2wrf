@@ -85,3 +85,15 @@ This package includes several advanced fail-safes and workarounds specific to pr
 - **Advanced Soil Splitting**: In ICON, Soil Moisture (`W_SO`) and Soil Temperature (`T_SO`) are frequently stored on conflicting vertical coordinates (`depthBelowLandLayer` vs `depthBelowLand`). The orchestrator automatically splits, extracts, and regrids these streams separately to prevent hypercube crashes.
 - **Smart Level Inversion**: WRF expects pressure levels to be strictly descending. The script checks your vertical layer structure and automatically applies CDO's `-invertlev` argument if necessary.
 - **Clean Input Filtering**: The script automatically filters out `.nc` files and background `.idx` files from the input directory so they don't break the batch loop.
+
+## Surface forcing series for an offline land-surface model (2026-09-15)
+
+`./run_surface_series.sh START END [OUT.nc] [JOBS]` streams the hourly ICON files from the FTP
+(download -> extract -> regrid -> delete, one raw file on disk per job) and writes ONE hourly NetCDF
+on the lon-lat product grid with what HRLDAS / Noah-MP needs — `T2D Q2D U2D V2D PSFC SWDOWN LWDOWN
+RAINRATE` — plus ICON's own `TG SHFLX LHFLX TSOIL(9 depths) WSOIL(8 layers) SNOWH SNOWC ALBEDO HSURF`.
+Run-cumulative fields are de-averaged/differenced against the previous lead of the same run; the
+stitching rule is "freshest run with lead >= 9 h" (`--spinup`); `LWDOWN = net LW + sigma*TG^4`.
+Ported from branch `icon2amundsen` (download-filter-delete) and reduced: `src/icon2wrf/surface_series.py`.
+Smoke test: `./run_surface_series.sh 2025071712 2025071715 /tmp/test.nc 1` (~90 s per hour, download-bound).
+Motivation: OPEN_ISSUES A28 (the ICON soil state) in the WRF project.
