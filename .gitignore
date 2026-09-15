@@ -24,3 +24,12 @@ credentials.toml
 
 # Archive
 archive/
+
+# secrets and run logs (never commit)
+.ftp_pass
+logs/
+season_*.out
+season_*.err
+devel_test_*.out
+devel_test_*.err
+input/sandbox_*/
