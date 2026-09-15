@@ -13,7 +13,10 @@ whose lead is >= --spinup hours (default 9; runs at 00/12 UTC, 48 h each); when 
 its lead-1 file is fetched too so the accumulated fields can be differenced. Missing hours are left
 as gaps and time-interpolated at the end (listed in the global attribute `filled_hours`).
 
-Output variables (HRLDAS LDASIN names where they exist), hourly, on the product grid:
+Output grid: --wrf-grid <wrfinput_d01> remaps straight onto the WRF mass grid (500 x 600 for the production
+domain, 3.8x fewer cells than the product grid and no second interpolation for HRLDAS); without it the
+lon-lat product grid of config/target_grid.txt is used.
+Output variables (HRLDAS LDASIN names where they exist), hourly:
   T2D   2 m temperature [K]              Q2D   2 m specific humidity [kg/kg] (from 2 m dew point + PSFC)
   U2D   10 m u wind [m/s]                V2D   10 m v wind [m/s]
   PSFC  surface pressure [Pa]            RAINRATE  precipitation rate [kg m-2 s-1] (tp differenced)
@@ -104,6 +107,23 @@ def extract_fields(grib_path, out_nc, wanted_invariant=False):
             ds[dim].attrs = {"units": "m", "positive": "down", "axis": "Z", "long_name": ln, "standard_name": "depth"}
     ds.to_netcdf(out_nc)
     return True
+
+
+def wrf_grid_description(wrfinput, out_txt):
+    """CDO curvilinear grid description of the WRF mass grid (XLAT/XLONG of a wrfinput), cached in out_txt."""
+    import netCDF4 as nc
+    out_txt = Path(out_txt)
+    if out_txt.exists():
+        return out_txt
+    ds = nc.Dataset(wrfinput)
+    lat, lon = np.asarray(ds["XLAT"][0]), np.asarray(ds["XLONG"][0]); ds.close()
+    ny, nx = lat.shape
+    with open(out_txt, "w") as f:
+        f.write(f"gridtype = curvilinear\ngridsize = {lat.size}\nxsize = {nx}\nysize = {ny}\n")
+        f.write("xvals = " + " ".join(f"{v:.6f}" for v in lon.ravel()) + "\n")
+        f.write("yvals = " + " ".join(f"{v:.6f}" for v in lat.ravel()) + "\n")
+    log(f"wrote WRF grid description {out_txt} ({ny} x {nx})")
+    return out_txt
 
 
 def cdo_remap(in_nc, out_nc, source_grid, target_grid):
@@ -225,10 +245,13 @@ def main():
     ap.add_argument("--work", help="scratch dir for the raw files (default: <input_dir>/sandbox_surface_<id>)")
     ap.add_argument("--keep-raw", action="store_true", help="do not delete the raw hourly files (debug)")
     ap.add_argument("--source-grid", default="config/source_grid.txt")
-    ap.add_argument("--target-grid", default="config/target_grid.txt")
+    ap.add_argument("--target-grid", default="config/target_grid.txt", help="CDO grid description of the output grid (lon-lat product grid by default)")
+    ap.add_argument("--wrf-grid", help="a wrfinput_d01: remap straight onto its mass grid (south_north x west_east) instead of --target-grid")
     args = ap.parse_args()
     import xarray as xr
 
+    if args.wrf_grid:
+        args.target_grid = str(wrf_grid_description(args.wrf_grid, Path("config") / f"wrf_grid_{Path(args.wrf_grid).stem}_{Path(args.wrf_grid).parent.name}.txt"))
     start, end = datetime.strptime(args.start, "%Y%m%d%H"), datetime.strptime(args.end, "%Y%m%d%H")
     out_nc = Path(args.out); out_nc.parent.mkdir(parents=True, exist_ok=True)
     work = Path(args.work) if args.work else Path("input") / f"sandbox_surface_{uuid.uuid4().hex[:8]}"
@@ -314,7 +337,7 @@ def main():
         ds["HSURF"] = xr.open_dataset(hsurf_nc)["HSURF"].load(); ds["HSURF"].attrs = {"long_name": "ICON terrain height (lead-0 file)", "units": "m"}
     ds.attrs.update({"title": "ICON 500 m (TEAMx sEOP) hourly surface forcing for an offline land-surface model",
                      "source": "ACINN FTP, freshest run with lead >= %d h; icon2wrf surface_series.py" % args.spinup,
-                     "grid": f"{args.target_grid} (lon-lat product grid); interpolate to the land-model grid downstream",
+                     "grid": (f"WRF mass grid of {args.wrf_grid} (south_north x west_east), HRLDAS-ready" if args.wrf_grid else f"{args.target_grid} (lon-lat product grid); interpolate to the land-model grid downstream"),
                      "filled_hours": " ".join(filled) if filled else "none", "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")})
     enc = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
     ds.to_netcdf(out_nc, encoding=enc)

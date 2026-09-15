@@ -1,20 +1,24 @@
 #!/bin/bash
 # Hourly ICON surface forcing for an offline land-surface model (HRLDAS / Noah-MP spin-up) in ONE file.
 #
-#   ./run_surface_series.sh START END [OUT.nc] [JOBS]
+#   ./run_surface_series.sh START END [OUT.nc] [JOBS] [WRFINPUT]
 #   ./run_surface_series.sh 2025061500 2025071800                       # -> output/icon_surface_2025061500_2025071800.nc
 #   ./run_surface_series.sh 2025071712 2025071715 /tmp/test.nc 1        # 4-hour smoke test
 #
 # Streams each hour from the ACINN FTP (download -> extract the surface fields -> regrid -> delete the
 # 900 MB raw file), so the disk footprint is one raw file per job. JOBS (default 4, max 8 = the FTP's
 # per-IP connection cap) splits the range into equal chunks that run in parallel; the chunks are
-# merged with `cdo mergetime`. Fields, stitching rule and units: src/icon2wrf/surface_series.py.
+# merged with `cdo mergetime`. WRFINPUT (5th arg, or $WRFINPUT, default: the production domain's
+# wrfinput below) confines the output to that WRF mass grid (south_north x west_east, HRLDAS-ready);
+# pass "none" for the full lon-lat product grid. Fields, stitching rule, units: src/icon2wrf/surface_series.py.
 # Needs: `module load cdo`, the `icon` conda env, config/credentials.toml, and the FTP password in
 # .ftp_pass (git-ignored). Run from the icon2wrf root, on the login node or inside a SLURM job.
 set -u
 cd "$(dirname "$0")"
 START=${1:?START YYYYMMDDHH}; END=${2:?END YYYYMMDDHH}
 OUT=${3:-output/icon_surface_${START}_${END}.nc}; JOBS=${4:-4}
+WRFINPUT=${5:-${WRFINPUT:-/gpfs/data/fs72996/ewahl/branko_runs/innval_pbl3d_X16b/wrfinput_d01}}
+GRIDARG=(); [ "$WRFINPUT" != "none" ] && { [ -f "$WRFINPUT" ] || { echo "WRFINPUT not found: $WRFINPUT"; exit 1; }; GRIDARG=(--wrf-grid "$WRFINPUT"); }
 [ "$JOBS" -gt 8 ] && JOBS=8
 
 module load cdo >/dev/null 2>&1 || true
@@ -39,12 +43,12 @@ while t <= e:
     t = u + timedelta(hours=1)
 EOF
 )
-echo "=== $START -> $END in ${#CHUNKS[@]} chunk(s) -> $OUT   ($(date))"
+echo "=== $START -> $END in ${#CHUNKS[@]} chunk(s) -> $OUT   grid: ${WRFINPUT}   ($(date))"
 PIDS=(); PARTS=()
 for c in "${CHUNKS[@]}"; do
     set -- $c
     part="${OUT%.nc}_part_$1_$2.nc"; PARTS+=("$part")
-    python -m src.icon2wrf.surface_series --start "$1" --end "$2" --out "$part" > "logs/surface_series_$1_$2.log" 2>&1 &
+    python -m src.icon2wrf.surface_series --start "$1" --end "$2" --out "$part" "${GRIDARG[@]}" > "logs/surface_series_$1_$2.log" 2>&1 &
     PIDS+=($!)
     sleep 2
 done
