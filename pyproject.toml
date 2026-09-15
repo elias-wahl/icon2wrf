@@ -10,6 +10,8 @@ requires-python = ">=3.9"
 dependencies = [
     "xarray",
     "cfgrib",
+    "eccodes",
+    "numpy",
     "netCDF4",
     "scipy",
     "tomli; python_version < '3.11'"
