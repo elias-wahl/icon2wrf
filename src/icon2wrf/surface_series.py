@@ -259,6 +259,40 @@ def derive(ds, run_dir, lead_h, state):
     return out
 
 
+# --------------------------------------------------------------------------- provenance
+FLAG_MEANINGS = ("normal_freshest_run_within_the_12h_window", "lead_below_spinup_fallback", "older_run_newer_run_missing_on_server",
+                 "filled_no_data_on_server", "missing_not_filled")
+
+
+def provenance_variables(full, prov, spinup):
+    """source_run / lead_hours / data_flag along the time axis (data_flag: 0 normal = lead spinup..spinup+11 h,
+    1 lead below spinup, 2 older run (lead above spinup+11 h), 3 filled, 4 missing). Flag 4 -> 3 is set by fill_gaps."""
+    import xarray as xr
+    n = len(full); run = np.zeros(n, "i4"); lead = np.full(n, -1, "i2"); flag = np.full(n, 4, "i1")   # i4: cdo has no int64
+    for i, t in enumerate(full):
+        p = prov.get(datetime.utcfromtimestamp(int(t.astype("datetime64[s]").astype(int))))
+        if p is not None:
+            run[i] = int(p[0].replace("_", "")); lead[i] = p[1]
+            flag[i] = 0 if spinup <= p[1] <= spinup + 11 else (1 if p[1] < spinup else 2)
+    return {"source_run": xr.DataArray(run, dims="time", attrs={"long_name": "ICON run the hour was taken from, as YYYYMMDDHH (0 = no data)"}),
+            "lead_hours": xr.DataArray(lead, dims="time", attrs={"long_name": "forecast lead of that run in hours (-1 = no data)", "units": "h"}),
+            "data_flag": xr.DataArray(flag, dims="time", attrs={"long_name": "provenance of the hour", "flag_values": np.arange(5, dtype="i1"),
+                                                                 "flag_meanings": " ".join(FLAG_MEANINGS)})}
+
+
+def provenance_summary(nc, stamp):
+    """Text for the global attribute provenance_summary from the data_flag variable (blocks per class)."""
+    flag = nc["data_flag"][:]; run = nc["source_run"][:]; lead = nc["lead_hours"][:]
+    def blocks(k):
+        idx = np.where(flag == k)[0]; out = []
+        for i in idx:
+            if out and i == out[-1][1] + 1: out[-1][1] = i
+            else: out.append([i, i])
+        return "; ".join(f"{stamp(a)}..{stamp(b)}" + (f" (run {run[a]}, leads {lead[a]}-{lead[b]})" if k in (1, 2) else "") for a, b in out) or "-"
+    return f"{len(flag)} hours: " + "; ".join(f"{int((flag == k).sum())} {FLAG_MEANINGS[k]}" + (f": {blocks(k)}" if k and (flag == k).any() else "")
+                                                for k in range(5)) + ". Per hour: variables source_run, lead_hours, data_flag."
+
+
 # --------------------------------------------------------------------------- gap filling
 def fill_gaps(path, method="auto", short=3):
     """Fill the hours of an hourly series that hold no data (all-NaN) in place, one gap block at a time.
@@ -329,6 +363,9 @@ def fill_gaps(path, method="auto", short=3):
                     nc[v][i, ...] = est.astype(nc[v].dtype)
             filled += list(range(i0, i1 + 1)); used.add(m)
             log(f"filled {n} h {stamp(i0)}..{stamp(i1)} ({m})")
+        if "data_flag" in nc.variables:
+            flag = nc["data_flag"][:]; flag[filled] = 3; flag[unfilled] = 4; nc["data_flag"][:] = flag
+            nc.setncattr("provenance_summary", provenance_summary(nc, stamp))
         nc.setncattr("filled_hours", " ".join(stamp(i) for i in filled) if filled else "none")
         nc.setncattr("unfilled_hours", " ".join(stamp(i) for i in unfilled) if unfilled else "none")
         nc.setncattr("fill_method", f"--fill {method}" + (f" (used: {', '.join(sorted(used))})" if used else "") +
@@ -376,7 +413,7 @@ def main():
     n_total = sum(len(v) for v in queue.values())
     log(f"{n_total} files to stream for {int((end - start).total_seconds() // 3600) + 1} target hours from {len(queue)} runs")
 
-    state, pieces, hsurf_nc = {}, [], None
+    state, pieces, hsurf_nc, prov = {}, [], None, {}      # prov: target hour -> (run_dir, lead)
     for run_dir, items in queue.items():
         for k in range(3):
             try:
@@ -422,7 +459,7 @@ def main():
             der = derive(ds, run_dir, lead_h, state)
             if is_prefetch:
                 continue
-            der = der.expand_dims(time=[np.datetime64(target, "ns")])
+            der = der.expand_dims(time=[np.datetime64(target, "ns")]); prov[target] = (run_dir, lead_h)
             der.attrs["source_run"] = run_dir; der.attrs["lead_hours"] = lead_h
             piece = work / f"piece_{target:%Y%m%d%H}.nc"
             der.to_netcdf(piece, encoding={v: {"zlib": True, "complevel": 4} for v in der.data_vars}); pieces.append(piece)
@@ -443,6 +480,7 @@ def main():
     full = np.arange(np.datetime64(start, "ns"), np.datetime64(end, "ns") + np.timedelta64(1, "h"), np.timedelta64(1, "h"))
     n_missing = len(full) - len(ds.time)
     ds = ds.reindex(time=full)               # missing hours become all-NaN steps; fill_gaps handles them
+    ds = ds.assign(provenance_variables(full, prov, args.spinup))
     if hsurf_nc is not None and hsurf_nc.exists():
         ds["HSURF"] = xr.open_dataset(hsurf_nc)["HSURF"].load(); ds["HSURF"].attrs = dict(zip(("long_name", "units"), META["HSURF"]))
     ds.attrs.update({"title": "ICON 500 m (TEAMx sEOP) hourly surface forcing for an offline land-surface model",
