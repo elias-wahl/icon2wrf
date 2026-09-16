@@ -11,7 +11,11 @@
 # merged with `cdo mergetime`. WRFINPUT (5th arg, or $WRFINPUT, default: the production domain's
 # wrfinput below) confines the output to that WRF mass grid (south_north x west_east, HRLDAS-ready);
 # a CDO grid description .txt works too (config/wrf_grid_wrfinput_d01_innval_pbl3d_X16b.txt is the
-# production grid, committed, so no wrfinput is needed on another machine); "none" = full product grid. Fields, stitching rule, units: src/icon2wrf/surface_series.py.
+# production grid, committed, so no wrfinput is needed on another machine); "none" = full product grid.
+# Missing hours are filled ONCE over the merged series ($FILL = auto|linear|diurnal, default auto; the chunks run
+# with --no-fill so gaps at chunk edges are bracketed too). Disk: ~26 MB per hour for the compressed pieces
+# during the run and about the same for the result (a 3-month series is ~65 GB) plus a ~12 GB merge spike per job.
+# Fields, stitching rule, units, fill methods: src/icon2wrf/surface_series.py.
 # Needs: `module load cdo`, the `icon` conda env, config/credentials.toml, and the FTP password in
 # .ftp_pass (git-ignored). Run from the icon2wrf root, on the login node or inside a SLURM job.
 set -u
@@ -26,7 +30,7 @@ if [ "$WRFINPUT" != "none" ]; then
 fi
 [ "$JOBS" -gt 8 ] && JOBS=8
 
-module load cdo >/dev/null 2>&1 || true
+command -v cdo >/dev/null 2>&1 || module load cdo >/dev/null 2>&1 || true   # a cdo already on PATH (e.g. the conda env's) wins over the module
 if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then source "$HOME/miniconda3/etc/profile.d/conda.sh"; conda activate icon; fi
 [ -f .ftp_pass ] && export FTP_PASSWORD="$(cat .ftp_pass)"
 : "${FTP_PASSWORD:?put the FTP password in .ftp_pass or export FTP_PASSWORD}"
@@ -48,27 +52,29 @@ while t <= e:
     t = u + timedelta(hours=1)
 EOF
 )
-echo "=== $START -> $END in ${#CHUNKS[@]} chunk(s) -> $OUT   grid: ${WRFINPUT}   ($(date))"
+FILL=${FILL:-auto}
+echo "=== $START -> $END in ${#CHUNKS[@]} chunk(s) -> $OUT   grid: ${WRFINPUT}   fill: ${FILL}   ($(date))"
 PIDS=(); PARTS=()
 for c in "${CHUNKS[@]}"; do
     set -- $c
     part="${OUT%.nc}_part_$1_$2.nc"; PARTS+=("$part")
-    python -m src.icon2wrf.surface_series --start "$1" --end "$2" --out "$part" "${GRIDARG[@]}" > "logs/surface_series_$1_$2.log" 2>&1 &
+    python -m src.icon2wrf.surface_series --start "$1" --end "$2" --out "$part" --no-fill "${GRIDARG[@]}" > "logs/surface_series_$1_$2.log" 2>&1 &
     PIDS+=($!)
     sleep 2
 done
 FAIL=0
 for i in "${!PIDS[@]}"; do wait "${PIDS[$i]}" || { echo "chunk ${CHUNKS[$i]} FAILED (see logs/)"; FAIL=1; }; done
-[ "$FAIL" -eq 1 ] && exit 1
+[ "$FAIL" -eq 1 ] && { echo "keeping the finished parts in $(dirname "$OUT") for a rerun of the failed chunk(s)"; exit 1; }
 if [ "${#PARTS[@]}" -eq 1 ]; then
     mv "${PARTS[0]}" "$OUT"
 else
-    cdo -s -O mergetime "${PARTS[@]}" "$OUT" && rm -f "${PARTS[@]}"
+    cdo -s -O -f nc4 -z zip_4 mergetime "${PARTS[@]}" "$OUT" && rm -f "${PARTS[@]}"
 fi
+python -m src.icon2wrf.surface_series --fill-only "$OUT" --fill "$FILL"    # one pass over the whole series: chunk-edge gaps are bracketed here
 python - "$OUT" <<'EOF'
 import sys, xarray as xr
 ds = xr.open_dataset(sys.argv[1])
-print(f"{sys.argv[1]}: {len(ds.time)} hours {str(ds.time.values[0])[:13]} .. {str(ds.time.values[-1])[:13]}, filled: {ds.attrs.get('filled_hours')}")
+print(f"{sys.argv[1]}: {len(ds.time)} hours {str(ds.time.values[0])[:13]} .. {str(ds.time.values[-1])[:13]}, filled: {ds.attrs.get('filled_hours')}, unfilled: {ds.attrs.get('unfilled_hours')}")
 for v in ("T2D", "Q2D", "U2D", "PSFC", "SWDOWN", "LWDOWN", "RAINRATE", "TSOIL", "HSURF"):
     if v in ds: print(f"  {v:9s} min {float(ds[v].min()):10.4g} max {float(ds[v].max()):10.4g}")
 EOF
