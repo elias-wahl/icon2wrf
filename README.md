@@ -99,4 +99,24 @@ By default the output is confined to the production WRF mass grid (500 x 600; 5t
 or the committed `config/wrf_grid_wrfinput_d01_innval_pbl3d_X16b.txt`; `none` = full product grid, 3.8x larger).
 Smoke test: `./run_surface_series.sh 2025071712 2025071715 /tmp/test.nc 1` (~90 s per hour, download-bound).
 Three-month spin-up forcing: `./run_surface_series.sh 2025040100 2025071800 output/icon_surface_2025040100_2025071800.nc 8`.
+
+Disk and time: the compressed hourly pieces take ~26 MB per hour during the run (a 3-month series ~65 GB, all of it
+on disk until each job's final merge), each job's `cdo mergetime` adds a ~12 GB spike, and the result is again
+~26 MB per hour (3 months ~65 GB). Make sure the quota covers that: at the hard limit downloads fail and every
+hour so lost becomes a filled hour. With 8 jobs the FTP delivers roughly one hour of data per minute per job.
+
+Missing hours: hours that no run on the server covers with a lead of 1-48 h stay NaN in the chunks (`--no-fill`)
+and are filled once over the merged series by `fill_gaps` (`FILL=auto|linear|diurnal ./run_surface_series.sh ...`,
+or `python -m src.icon2wrf.surface_series --fill-only FILE --fill diurnal`). `linear` interpolates between the
+bracket hours; `diurnal` uses the same clock hour of the day before and after, weighted across the gap and
+offset-blended to the bracket hours, so a gap spanning a night keeps its night; `auto` (default) takes linear
+for gaps of up to 3 h and diurnal beyond. The filled hours are listed in the global attribute `filled_hours`,
+the method in `fill_method`; gaps at the very start or end of the series stay NaN (`unfilled_hours`).
+
+Check a finished series with `python -m src.icon2wrf.validate_surface_series FILE`: per hour and field it reports
+NaNs, min/max against physical ranges, suspiciously constant fields and jumps of the domain mean, streaming the
+file in 24-hour blocks (a 65 GB file takes ~15 min).
+
+On a cluster whose `module load cdo` provides an old cdo, activate the conda env first: the wrapper only loads the
+module when no `cdo` is on the PATH.
 Motivation: OPEN_ISSUES A28 (the ICON soil state) in the WRF project.
