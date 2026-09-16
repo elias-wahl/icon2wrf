@@ -113,6 +113,12 @@ offset-blended to the bracket hours, so a gap spanning a night keeps its night; 
 for gaps of up to 3 h and diurnal beyond. The filled hours are listed in the global attribute `filled_hours`,
 the method in `fill_method`; gaps at the very start or end of the series stay NaN (`unfilled_hours`).
 
+Initial land state: `python -m src.icon2wrf.surface_series --init-state FILE` fetches the one ICON file behind the first
+hour of a finished series (its `source_run`/`lead_hours`) and appends `SNEQV_init` (snow water equivalent), `RHOSNOW_init`,
+`TSNOW_init`, `FRESHSNW_init` and `WSOIL_ICE_init(soil_layer_bottom)` as time-independent variables — what Noah-MP needs to
+initialise its snow and frozen-soil state, and a reference for evaluating the spin-up. HRLDAS does not read snow or
+soil fields from the forcing, so these are not hourly.
+
 Check a finished series with `python -m src.icon2wrf.validate_surface_series FILE`: per hour and field it reports
 NaNs, min/max against physical ranges, suspiciously constant fields and jumps of the domain mean, streaming the
 file in 24-hour blocks (a 65 GB file takes ~15 min).

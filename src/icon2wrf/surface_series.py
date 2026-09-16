@@ -34,11 +34,15 @@ Usage (from the icon2wrf root, `icon` conda env, `module load cdo`, FTP_PASSWORD
   python -m src.icon2wrf.surface_series --start 2025061500 --end 2025071800 --out output/icon_surface_2025061500_2025071800.nc
   python -m src.icon2wrf.surface_series --start 2025071712 --end 2025071715 --out /tmp/test.nc --keep-raw   # smoke test
 The bash wrapper run_surface_series.sh splits a long range into parallel chunks and merges them.
+  python -m src.icon2wrf.surface_series --init-state output/series.nc   # append SNEQV/RHOSNOW/TSNOW/FRESHSNW/WSOIL_ICE _init
+    (the ICON snow / soil-ice state at the first hour, from the run and lead the file's provenance names; initial
+    conditions and evaluation fields for the offline land model, not forcing)
 """
 import argparse
 import ftplib
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -71,6 +75,12 @@ CUMUL = {"ASWDIR_S": "swdir", "ASWDIFD_S": "swdif", "avg_snlwrf": "lwnet", "avg_
          "avg_slhtf": "LHFLX", "tp": "tp"}
 SOIL = {"T_SO": "TSOIL", "W_SO": "WSOIL"}
 INVARIANT = {"HSURF": "HSURF"}
+# initial land state for the offline model (--init-state): read once, for the first hour of a series
+INIT_INSTANT = {"sd": "SNEQV", "rsn": "RHOSNOW", "T_SNOW": "TSNOW", "FRESHSNW": "FRESHSNW"}
+INIT_SOIL = {"W_SO_ICE": "WSOIL_ICE"}
+INIT_META = {"SNEQV": ("snow water equivalent W_SNOW", "kg m-2"), "RHOSNOW": ("snow density RHO_SNOW (0 where snow-free)", "kg m-3"),
+             "TSNOW": ("snow surface temperature T_SNOW (0 where snow-free)", "K"), "FRESHSNW": ("fresh snow factor (albedo aging, 1 = fresh)", "1"),
+             "WSOIL_ICE": ("soil ice content W_SO_ICE per layer", "kg m-2")}
 
 
 def log(msg):
@@ -78,8 +88,9 @@ def log(msg):
 
 
 # --------------------------------------------------------------------------- GRIB -> NetCDF
-def extract_fields(grib_path, out_nc, wanted_invariant=False):
-    """One ecCodes pass over the hourly file; writes the wanted fields on the native 'values' axis."""
+def extract_fields(grib_path, out_nc, wanted_invariant=False, instant=INSTANT, cumul=CUMUL, soil_map=SOIL):
+    """One ecCodes pass over the hourly file; writes the wanted fields on the native 'values' axis.
+    The field maps default to the forcing fields; --init-state passes INIT_INSTANT / INIT_SOIL."""
     import eccodes
     import xarray as xr
 
@@ -92,19 +103,19 @@ def extract_fields(grib_path, out_nc, wanted_invariant=False):
             try:
                 sn = eccodes.codes_get(gid, "shortName", str)
                 st = eccodes.codes_get(gid, "stepType", str) if eccodes.codes_is_defined(gid, "stepType") else "instant"
-                if sn in INSTANT and st == "instant":
-                    fields[INSTANT[sn]] = eccodes.codes_get_values(gid)
-                elif sn in CUMUL and st in ("avg", "accum"):
-                    fields[CUMUL[sn]] = eccodes.codes_get_values(gid)
-                elif sn in SOIL:
+                if sn in instant and st == "instant":
+                    fields[instant[sn]] = eccodes.codes_get_values(gid)
+                elif sn in cumul and st in ("avg", "accum"):
+                    fields[cumul[sn]] = eccodes.codes_get_values(gid)
+                elif sn in soil_map:
                     sv = eccodes.codes_get(gid, "scaledValueOfFirstFixedSurface", float)
                     sf = eccodes.codes_get(gid, "scaleFactorOfFirstFixedSurface", float)
                     depth = sv * 10.0 ** (-sf)
-                    if sn == "W_SO":  # layer: use the bottom bound of the layer
+                    if sn in ("W_SO", "W_SO_ICE"):  # layer: use the bottom bound of the layer
                         sv2 = eccodes.codes_get(gid, "scaledValueOfSecondFixedSurface", float)
                         sf2 = eccodes.codes_get(gid, "scaleFactorOfSecondFixedSurface", float)
                         depth = sv2 * 10.0 ** (-sf2)
-                    soil.setdefault(SOIL[sn], {})[depth] = eccodes.codes_get_values(gid)
+                    soil.setdefault(soil_map[sn], {})[depth] = eccodes.codes_get_values(gid)
                 elif wanted_invariant and sn in INVARIANT:
                     fields[INVARIANT[sn]] = eccodes.codes_get_values(gid)
             finally:
@@ -376,6 +387,58 @@ def fill_gaps(path, method="auto", short=3):
     return filled, unfilled
 
 
+# --------------------------------------------------------------------------- initial land state
+def add_initial_state(path, source_grid, target_grid=None, work=None):
+    """Append the snow / soil-ice state of the FIRST hour of an existing series as time-independent
+    variables SNEQV_init, RHOSNOW_init, TSNOW_init, FRESHSNW_init, WSOIL_ICE_init(soil_layer_bottom).
+    The file's own provenance (source_run, lead_hours at index 0) says which ICON file to fetch, so the
+    state is the one that goes with the first forcing hour. These are initial conditions / evaluation
+    fields for the offline land model, not forcing (HRLDAS ignores snow and soil variables in LDASIN)."""
+    import netCDF4
+    import xarray as xr
+    with netCDF4.Dataset(path) as nc:
+        run, lead = int(nc["source_run"][0]), int(nc["lead_hours"][0])
+        tv = nc["time"]; t0 = netCDF4.num2date(tv[0], tv.units, only_use_cftime_datetimes=False)
+        if target_grid is None:
+            m = re.search(r"(\S+\.txt)", nc.getncattr("grid")); target_grid = m.group(1) if m else "config/target_grid.txt"
+    if run == 0 or lead < 0:
+        sys.exit("the first hour of the series is a filled hour; no ICON state to fetch")
+    run_dir, gz = f"{run // 100:08d}_{run % 100:02d}", get_filename_for_offset(lead)
+    creds = load_credentials(); url, user, password = creds.get("url"), creds.get("username"), os.environ.get("FTP_PASSWORD")
+    work = Path(work) if work else Path("input") / f"sandbox_init_{uuid.uuid4().hex[:8]}"
+    work.mkdir(parents=True, exist_ok=True)
+    raw, tmp = work / gz[:-3], work / gz
+    ftp = ftp_connect(url, user, password); ftp.cwd("/" + run_dir)
+    log(f"initial state for {t0:%Y-%m-%d %H} UT <- {run_dir} lead {lead} h: downloading {gz}")
+    with open(tmp, "wb") as fh:
+        ftp.retrbinary(f"RETR {gz}", fh.write)
+    ftp.quit(); extract_gz(tmp, raw); tmp.unlink(missing_ok=True)
+    raw_nc, rem_nc = work / "init_fields.nc", work / "init_grid.nc"
+    if not extract_fields(raw, raw_nc, instant=INIT_INSTANT, cumul={}, soil_map=INIT_SOIL):
+        sys.exit(f"no initial-state fields in {raw}")
+    raw.unlink(missing_ok=True)
+    cdo_remap(raw_nc, rem_nc, source_grid, target_grid); raw_nc.unlink(missing_ok=True)
+    ds = xr.open_dataset(rem_nc).load(); rem_nc.unlink(missing_ok=True)
+    with netCDF4.Dataset(path, "r+") as nc:
+        for v in INIT_META:
+            if v not in ds:
+                log(f"[WARNING] {v} not in the ICON file"); continue
+            name = f"{v}_init"; dims = ("soil_layer_bottom", "y", "x") if ds[v].ndim == 3 else ("y", "x")
+            if dims[0] == "soil_layer_bottom" and ds[v].shape[0] != len(nc.dimensions["soil_layer_bottom"]):
+                log(f"[WARNING] {v}: {ds[v].shape[0]} layers vs {len(nc.dimensions['soil_layer_bottom'])} in the file, skipped"); continue
+            var = nc[name] if name in nc.variables else nc.createVariable(name, "f4", dims, zlib=True, complevel=4)
+            var[:] = ds[v].values.astype("f4")
+            var.setncatts({"long_name": INIT_META[v][0] + f" at the first hour of the series ({t0:%Y-%m-%dT%H})", "units": INIT_META[v][1],
+                           "valid_time": f"{t0:%Y-%m-%dT%H}", "source": f"ICON run {run_dir} lead {lead} h",
+                           "comment": "initial land state / evaluation field for the offline land model, not forcing"})
+            log(f"  {name} written")
+        nc.setncattr("initial_state", f"SNEQV/RHOSNOW/TSNOW/FRESHSNW/WSOIL_ICE _init: ICON state at {t0:%Y-%m-%dT%H} from run {run_dir} lead {lead} h")
+    try:
+        work.rmdir()
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -391,11 +454,15 @@ def main():
     ap.add_argument("--fill", default="auto", choices=("auto", "linear", "diurnal"), help="how missing hours are filled (see fill_gaps; default auto)")
     ap.add_argument("--no-fill", action="store_true", help="leave missing hours as NaN (the wrapper fills once over the merged series)")
     ap.add_argument("--fill-only", metavar="FILE", help="only run the gap-filling pass in place on an existing hourly series and exit")
+    ap.add_argument("--init-state", metavar="FILE", help="append the snow / soil-ice initial state of the first hour to an existing series (fetches that one ICON file) and exit")
     args = ap.parse_args()
     import xarray as xr
 
     if args.fill_only:
         fill_gaps(args.fill_only, args.fill)
+        return
+    if args.init_state:
+        add_initial_state(args.init_state, args.source_grid, args.target_grid if args.target_grid != "config/target_grid.txt" else None, args.work)
         return
     if not (args.start and args.end and args.out):
         ap.error("--start, --end and --out are required (or use --fill-only FILE)")
