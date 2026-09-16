@@ -10,8 +10,12 @@ pieces). Ported 2026-09-15 from the download-filter-delete pipeline of branch ic
 
 Forecast stitching ("freshest" strategy, as on the branch): for every target hour take the newest run
 whose lead is >= --spinup hours (default 9; runs at 00/12 UTC, 48 h each); when a run is entered,
-its lead-1 file is fetched too so the accumulated fields can be differenced. Missing hours are left
-as gaps and time-interpolated at the end (listed in the global attribute `filled_hours`).
+its lead-1 file is fetched too so the accumulated fields can be differenced. Hours no run on the server
+covers are filled afterwards by `fill_gaps` (--fill auto|linear|diurnal: linear for short gaps, for
+longer ones the diurnal cycle of the day before/after blended to the bracket hours; listed in the global
+attribute `filled_hours`, method in `fill_method`). The wrapper runs that pass once over the merged
+series (chunks use --no-fill), so gaps at chunk edges are bracketed too. Disk: pieces and the result are
+zlib-compressed, ~26 MB per hour each, plus a ~12 GB `cdo mergetime` spike per job.
 
 Output grid: --wrf-grid <wrfinput_d01> remaps straight onto the WRF mass grid (500 x 600 for the production
 domain, 3.8x fewer cells than the product grid and no second interpolation for HRLDAS); without it the
@@ -47,6 +51,18 @@ import numpy as np
 from .download_ftp import load_credentials, extract_gz, get_filename_for_offset
 
 SB = 5.670374e-8
+
+# CF metadata for the fields copied straight from the GRIB (units as in ICON's GRIB2 headers)
+META = {"T2D": ("2 m temperature", "K"), "U2D": ("10 m u wind component", "m s-1"), "V2D": ("10 m v wind component", "m s-1"),
+        "PSFC": ("surface pressure", "Pa"), "TG": ("ground (skin) temperature T_G", "K"), "SNOWH": ("snow depth", "m"),
+        "SNOWC": ("snow cover fraction", "%"), "ALBEDO": ("forecast surface albedo", "%"),
+        "TSOIL": ("soil temperature T_SO (ICON multilayer soil model)", "K"),
+        "WSOIL": ("column-integrated soil water W_SO per layer (ICON multilayer soil model)", "kg m-2"),
+        "HSURF": ("ICON terrain height (lead-0 file)", "m")}
+# physical bounds applied to filled (interpolated) values
+BOUNDS = {"SWDOWN": (0, None), "RAINRATE": (0, None), "SNOWH": (0, None), "SNOWC": (0, 100), "ALBEDO": (0, 100),
+          "WSOIL": (0, None), "Q2D": (0, None)}
+INTERMITTENT = ("SWDOWN", "RAINRATE", "SHFLX", "LHFLX")   # filled without the offset blend (see fill_gaps)
 
 # shortName -> (output name, stepType expected)   "avg"/"accum" fields are run-cumulative and get de-accumulated
 INSTANT = {"2t": "T2D", "2d": "TD2", "10u": "U2D", "10v": "V2D", "sp": "PSFC", "T_G": "TG",
@@ -226,30 +242,125 @@ def derive(ds, run_dir, lead_h, state):
         interval = f"run-mean since start of {run_dir} (no previous lead)"
     out["SWDOWN"] = xr.where(sw < 0, 0.0, sw).astype("f4")
     out["LWDOWN"] = (lwnet + SB * tg_mean ** 4).astype("f4")
+    # `interval` describes the rule, not this piece: cdo mergetime keeps only the first piece's variable
+    # attributes, so a per-piece text would end up frozen in the merged file
+    generic = ("hourly mean over the hour ending at the time stamp, de-accumulated against the previous lead of "
+               "the same run (run-mean since start where a run has no previous lead)")
     for v, ln, u in (("SWDOWN", "downwelling shortwave at the surface, direct + diffuse", "W m-2"),
                      ("LWDOWN", "downwelling longwave at the surface = net LW + sigma*TG^4 (emissivity 1)", "W m-2"),
                      ("RAINRATE", "precipitation rate", "kg m-2 s-1"), ("SHFLX", "ICON sensible heat flux, upward positive (sign flipped from ICON)", "W m-2"),
                      ("LHFLX", "ICON latent heat flux, upward positive (sign flipped from ICON)", "W m-2")):
-        out[v].attrs = {"long_name": ln, "units": u, "interval": interval}
+        out[v].attrs = {"long_name": ln, "units": u, "interval": generic}
+    for v, (ln, u) in META.items():
+        if v in out:
+            out[v].attrs = {"long_name": ln, "units": u}
+    out.attrs["interval"] = interval
     state[run_dir] = {"lead": lead_h, "TG": ds["TG"], **{k: ds[k] for k in ("swdir", "swdif", "lwnet", "SHFLX", "LHFLX", "tp")}}
     return out
+
+
+# --------------------------------------------------------------------------- gap filling
+def fill_gaps(path, method="auto", short=3):
+    """Fill the hours of an hourly series that hold no data (all-NaN) in place, one gap block at a time.
+
+    linear   between the last valid hour before and the first valid hour after the block (what
+             xarray's interpolate_na('time') does; fine for a few hours, but a gap spanning a night
+             bracketed by daytime hours gets daytime radiation all night).
+    diurnal  same clock hour of the day before and the day after, weighted linearly across the block,
+             plus a linearly blended offset so state variables join the bracket hours without a step
+             (not applied to the intermittent fluxes SWDOWN/RAINRATE/SHFLX/LHFLX); falls back to what is
+             available where a day-before/after reference is itself missing, and to linear where none is.
+    auto     linear for blocks of <= `short` hours, diurnal for longer ones (default).
+    Blocks without a valid hour on both sides (series edges) stay NaN and are listed in `unfilled_hours`;
+    this is why the wrapper runs the pass once over the merged series instead of per chunk.
+    Values are clipped to physical bounds (BOUNDS). Sets the global attributes filled_hours,
+    unfilled_hours and fill_method. Streams: a handful of single-hour fields in memory at a time."""
+    import netCDF4
+    from datetime import timedelta as _td
+    with netCDF4.Dataset(path, "r+") as nc:
+        nc.set_auto_mask(False)
+        tv = nc["time"]
+        times = netCDF4.num2date(tv[:], tv.units, getattr(tv, "calendar", "standard"), only_use_cftime_datetimes=False)
+        stamp = lambda i: (times[i] + _td(minutes=30)).strftime("%Y-%m-%dT%H")     # nearest hour
+        tvars = [v for v in nc.variables if v != "time" and "time" in nc[v].dimensions and nc[v].ndim >= 3]
+        ind = "T2D" if "T2D" in tvars else tvars[0]
+        nt = len(times)
+        empty = np.array([bool(np.isnan(nc[ind][i, ...]).all()) for i in range(nt)])
+        blocks, i = [], 0
+        while i < nt:
+            if empty[i]:
+                j = i
+                while j + 1 < nt and empty[j + 1]:
+                    j += 1
+                blocks.append((i, j)); i = j + 1
+            else:
+                i += 1
+        row = lambda v, i: nc[v][i, ...].astype("f8")
+        valid = lambda i: 0 <= i < nt and not empty[i]
+        filled, unfilled, used = [], [], set()
+        for i0, i1 in blocks:
+            a, b = i0 - 1, i1 + 1
+            if a < 0 or b >= nt:
+                unfilled += list(range(i0, i1 + 1)); continue
+            n = i1 - i0 + 1
+            m = method if method != "auto" else ("linear" if n <= short else "diurnal")
+            for v in tvars:
+                A, B = row(v, a), row(v, b)
+                cA = A - row(v, a - 24) if valid(a - 24) else None
+                cB = B - row(v, b + 24) if valid(b + 24) else None
+                for i in range(i0, i1 + 1):
+                    w = (b - i) / (b - a)                      # 1 next to a, 0 next to b
+                    est = w * A + (1 - w) * B                  # linear
+                    if m == "diurnal":
+                        p = row(v, i - 24) if valid(i - 24) else None
+                        q = row(v, i + 24) if valid(i + 24) else None
+                        if p is not None and q is not None:
+                            est = w * p + (1 - w) * q
+                        elif p is not None or q is not None:
+                            est = p if p is not None else q
+                        if (p is not None or q is not None) and v not in INTERMITTENT:
+                            if cA is not None and cB is not None:
+                                est = est + w * cA + (1 - w) * cB
+                            elif cA is not None or cB is not None:
+                                est = est + (cA if cA is not None else cB)
+                    lo, hi = BOUNDS.get(v, (None, None))
+                    if lo is not None or hi is not None:
+                        est = np.clip(est, lo, hi)
+                    nc[v][i, ...] = est.astype(nc[v].dtype)
+            filled += list(range(i0, i1 + 1)); used.add(m)
+            log(f"filled {n} h {stamp(i0)}..{stamp(i1)} ({m})")
+        nc.setncattr("filled_hours", " ".join(stamp(i) for i in filled) if filled else "none")
+        nc.setncattr("unfilled_hours", " ".join(stamp(i) for i in unfilled) if unfilled else "none")
+        nc.setncattr("fill_method", f"--fill {method}" + (f" (used: {', '.join(sorted(used))})" if used else "") +
+                     "; linear = between the bracket hours; diurnal = same hour of the day before/after, weighted across the "
+                     "gap, offset-blended to the bracket hours except SWDOWN/RAINRATE/SHFLX/LHFLX; clipped to physical bounds")
+    log(f"gap filling: {len(filled)} hours filled, {len(unfilled)} left NaN (series edge) in {path}")
+    return filled, unfilled
 
 
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--start", required=True, help="first target hour YYYYMMDDHH (UTC)")
-    ap.add_argument("--end", required=True, help="last target hour YYYYMMDDHH (UTC)")
-    ap.add_argument("--out", required=True, help="output NetCDF (one file, hourly)")
+    ap.add_argument("--start", help="first target hour YYYYMMDDHH (UTC)")
+    ap.add_argument("--end", help="last target hour YYYYMMDDHH (UTC)")
+    ap.add_argument("--out", help="output NetCDF (one file, hourly)")
     ap.add_argument("--spinup", type=int, default=9, help="minimum forecast lead in hours (default 9)")
     ap.add_argument("--work", help="scratch dir for the raw files (default: <input_dir>/sandbox_surface_<id>)")
     ap.add_argument("--keep-raw", action="store_true", help="do not delete the raw hourly files (debug)")
     ap.add_argument("--source-grid", default="config/source_grid.txt")
     ap.add_argument("--target-grid", default="config/target_grid.txt", help="CDO grid description of the output grid (lon-lat product grid by default)")
     ap.add_argument("--wrf-grid", help="a wrfinput_d01: remap straight onto its mass grid (south_north x west_east) instead of --target-grid")
+    ap.add_argument("--fill", default="auto", choices=("auto", "linear", "diurnal"), help="how missing hours are filled (see fill_gaps; default auto)")
+    ap.add_argument("--no-fill", action="store_true", help="leave missing hours as NaN (the wrapper fills once over the merged series)")
+    ap.add_argument("--fill-only", metavar="FILE", help="only run the gap-filling pass in place on an existing hourly series and exit")
     args = ap.parse_args()
     import xarray as xr
 
+    if args.fill_only:
+        fill_gaps(args.fill_only, args.fill)
+        return
+    if not (args.start and args.end and args.out):
+        ap.error("--start, --end and --out are required (or use --fill-only FILE)")
     if args.wrf_grid:
         args.target_grid = str(wrf_grid_description(args.wrf_grid, Path("config") / f"wrf_grid_{Path(args.wrf_grid).stem}_{Path(args.wrf_grid).parent.name}.txt"))
     start, end = datetime.strptime(args.start, "%Y%m%d%H"), datetime.strptime(args.end, "%Y%m%d%H")
@@ -266,7 +377,6 @@ def main():
     log(f"{n_total} files to stream for {int((end - start).total_seconds() // 3600) + 1} target hours from {len(queue)} runs")
 
     state, pieces, hsurf_nc = {}, [], None
-    first_dir = next(iter(queue))
     for run_dir, items in queue.items():
         for k in range(3):
             try:
@@ -274,8 +384,8 @@ def main():
             except Exception:
                 ftp = ftp_connect(url, user, password)
         fetch = list(items)
-        if run_dir == first_dir:
-            fetch.insert(0, (None, get_filename_for_offset(0), True))     # lead 0: HSURF
+        if hsurf_nc is None:
+            fetch.insert(0, (None, get_filename_for_offset(0), True))     # lead 0: HSURF (first run that has one)
         for target, gz, is_prefetch in fetch:
             raw = work / (gz[:-3] if target is None else f"{target:%Y%m%d%H}_{gz[:-3]}")
             if not raw.exists():
@@ -314,7 +424,8 @@ def main():
                 continue
             der = der.expand_dims(time=[np.datetime64(target, "ns")])
             der.attrs["source_run"] = run_dir; der.attrs["lead_hours"] = lead_h
-            piece = work / f"piece_{target:%Y%m%d%H}.nc"; der.to_netcdf(piece); pieces.append(piece)
+            piece = work / f"piece_{target:%Y%m%d%H}.nc"
+            der.to_netcdf(piece, encoding={v: {"zlib": True, "complevel": 4} for v in der.data_vars}); pieces.append(piece)
             log(f"{target:%Y-%m-%d %H} UT <- {run_dir} lead {lead_h:2d} h   ({len(pieces)} hours done)")
     try:
         ftp.quit()
@@ -323,24 +434,24 @@ def main():
     if not pieces:
         sys.exit("nothing produced")
     merged = work / "merged.nc"
-    r = subprocess.run(["cdo", "-s", "-O", "mergetime"] + [str(p) for p in sorted(pieces)] + [str(merged)], capture_output=True, text=True)
+    r = subprocess.run(["cdo", "-s", "-O", "-f", "nc4", "-z", "zip_4", "mergetime"] + [str(p) for p in sorted(pieces)] + [str(merged)],
+                       capture_output=True, text=True)
     if r.returncode != 0:
+        merged.unlink(missing_ok=True)       # the pieces stay for a rerun / manual merge
         sys.exit(f"cdo mergetime failed: {r.stderr[-800:]}")
     ds = xr.open_dataset(merged).load()
-    filled = []
-    if missing:
-        full = np.arange(np.datetime64(start, "ns"), np.datetime64(end, "ns") + np.timedelta64(1, "h"), np.timedelta64(1, "h"))
-        ds = ds.reindex(time=full)
-        filled = [str(t)[:13] for t in full if t not in xr.open_dataset(merged).time.values]
-        ds = ds.interpolate_na("time")
+    full = np.arange(np.datetime64(start, "ns"), np.datetime64(end, "ns") + np.timedelta64(1, "h"), np.timedelta64(1, "h"))
+    n_missing = len(full) - len(ds.time)
+    ds = ds.reindex(time=full)               # missing hours become all-NaN steps; fill_gaps handles them
     if hsurf_nc is not None and hsurf_nc.exists():
-        ds["HSURF"] = xr.open_dataset(hsurf_nc)["HSURF"].load(); ds["HSURF"].attrs = {"long_name": "ICON terrain height (lead-0 file)", "units": "m"}
+        ds["HSURF"] = xr.open_dataset(hsurf_nc)["HSURF"].load(); ds["HSURF"].attrs = dict(zip(("long_name", "units"), META["HSURF"]))
     ds.attrs.update({"title": "ICON 500 m (TEAMx sEOP) hourly surface forcing for an offline land-surface model",
                      "source": "ACINN FTP, freshest run with lead >= %d h; icon2wrf surface_series.py" % args.spinup,
-                     "grid": (f"WRF mass grid of {args.wrf_grid} (south_north x west_east), HRLDAS-ready" if args.wrf_grid else f"{args.target_grid} (lon-lat product grid); interpolate to the land-model grid downstream"),
-                     "filled_hours": " ".join(filled) if filled else "none", "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")})
+                     "grid": grid_description_text(args.target_grid, args.wrf_grid),
+                     "filled_hours": "none", "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")})
+    ds.attrs.pop("interval", None)
     enc = {v: {"zlib": True, "complevel": 4} for v in ds.data_vars}
-    ds.to_netcdf(out_nc, encoding=enc)
+    ds.to_netcdf(out_nc, encoding=enc); ds.close()
     for p in pieces: p.unlink(missing_ok=True)
     merged.unlink(missing_ok=True)
     if hsurf_nc is not None: hsurf_nc.unlink(missing_ok=True)
@@ -348,7 +459,22 @@ def main():
         work.rmdir()
     except OSError:
         pass
-    log(f"wrote {out_nc}  ({len(ds.time)} hours, {len(filled)} interpolated)")
+    log(f"wrote {out_nc}  ({len(full)} hours, {n_missing} missing" + (", left NaN for the final fill pass)" if args.no_fill else ")"))
+    if n_missing and not args.no_fill:
+        fill_gaps(out_nc, args.fill)
+
+
+def grid_description_text(target_grid, wrf_grid=None):
+    """Human-readable description of the output grid for the global attribute `grid`."""
+    if wrf_grid:
+        return f"WRF mass grid of {wrf_grid} (south_north x west_east), HRLDAS-ready"
+    try:
+        gridtype = next(l.split("=")[1].strip() for l in open(target_grid) if l.strip().startswith("gridtype"))
+    except (OSError, StopIteration):
+        gridtype = "unknown"
+    if gridtype == "curvilinear":
+        return f"curvilinear target grid from CDO grid description {target_grid} (a WRF mass grid, south_north x west_east: HRLDAS-ready)"
+    return f"{target_grid} ({gridtype} product grid); interpolate to the land-model grid downstream"
 
 
 if __name__ == "__main__":
