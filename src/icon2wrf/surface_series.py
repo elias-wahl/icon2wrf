@@ -363,9 +363,10 @@ def fill_gaps(path, method="auto", short=3):
                     nc[v][i, ...] = est.astype(nc[v].dtype)
             filled += list(range(i0, i1 + 1)); used.add(m)
             log(f"filled {n} h {stamp(i0)}..{stamp(i1)} ({m})")
-        if "data_flag" in nc.variables:
+        if "data_flag" in nc.variables:      # filled/unfilled lists from the flags: also right for a series filled in several passes
             flag = nc["data_flag"][:]; flag[filled] = 3; flag[unfilled] = 4; nc["data_flag"][:] = flag
             nc.setncattr("provenance_summary", provenance_summary(nc, stamp))
+            filled, unfilled = list(np.where(flag == 3)[0]), list(np.where(flag == 4)[0])
         nc.setncattr("filled_hours", " ".join(stamp(i) for i in filled) if filled else "none")
         nc.setncattr("unfilled_hours", " ".join(stamp(i) for i in unfilled) if unfilled else "none")
         nc.setncattr("fill_method", f"--fill {method}" + (f" (used: {', '.join(sorted(used))})" if used else "") +
